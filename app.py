@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, time, date
 from zoneinfo import ZoneInfo
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 app = Flask(__name__)
 TZ = ZoneInfo("Europe/Rome")
@@ -17,16 +18,17 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 if not OPENAI_API_KEY:
     raise RuntimeError("Manca OPENAI_API_KEY nelle variabili Railway.")
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary").strip()  # consigliato: primary
+CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "").strip()
+if not CALENDAR_ID:
+    raise RuntimeError("Manca GOOGLE_CALENDAR_ID nelle variabili Railway (metti l'ID @group.calendar.google.com).")
 
-# Se non vuoi caricare file, puoi mettere tutta la JSON nella variabile:
-# GOOGLE_CREDENTIALS_JSON
+# credenziali Google: o file (credentials.json) oppure variabile GOOGLE_CREDENTIALS_JSON
 creds_path = "credentials.json"
 creds_env = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
 if creds_env:
+    # scrive il file ogni avvio (ok per Railway)
     with open(creds_path, "w", encoding="utf-8") as f:
         f.write(creds_env)
 
@@ -37,11 +39,11 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 credentials = service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
 calendar = build("calendar", "v3", credentials=credentials)
 
-SLOT_MINUTES = 30
 SERVICE_NAME = "Taglio uomo"
+SLOT_MINUTES = 30
 
 # =========================
-# ORARI PARRUCCHIERE (fissi)
+# ORARI PARRUCCHIERE
 # lun=0 ... dom=6
 # =========================
 OPENING = {
@@ -51,21 +53,76 @@ OPENING = {
     4: [(time(8, 30), time(12, 0)), (time(15, 0), time(18, 0))],  # ven
     5: [(time(8, 30), time(13, 0)), (time(15, 0), time(18, 0))],  # sab
 }
-# lun e dom chiuso (0 e 6 non presenti)
 
 # =========================
 # MEMORIA BREVE (SESSIONI)
 # =========================
-SESSIONS = {}  # {phone: {"state":..., "proposed":[...], "chosen":..., "history":[...] }}
+SESSIONS = {}
+
+# stati
+IDLE = "IDLE"
+ASK_DAY = "ASK_DAY"
+ASK_TIME = "ASK_TIME"
+OFFER_PICK = "OFFER_PICK"          # scegli 1/2/3
+CONFIRM = "CONFIRM"                # conferma OK/annulla
+ASK_ALTERNATIVE = "ASK_ALTERNATIVE" # "Vuoi che ti proponga altri orari?"
+WAIT_CUSTOM_TIME = "WAIT_CUSTOM_TIME" # dopo che propone altri, l'utente può scrivere ora o scegliere 1/2/3
 
 CONFIRM_WORDS = {"ok", "va bene", "perfetto", "si", "sì", "confermo", "confermiamo", "bene"}
-CANCEL_WORDS = {"annulla", "no", "non va bene", "cancella"}
+NEGATIVE_WORDS = {"no", "non posso", "non va bene", "annulla", "cancella", "stop", "niente"}
+YES_WORDS = {"si", "sì", "ok", "va bene", "certo", "perfetto", "dai", "y"}
 
 # =========================
-# HELPERS ORARI / SLOTS
+# HELPERS
 # =========================
+def now():
+    return datetime.now(TZ)
+
 def combine(d: date, t: time) -> datetime:
     return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=TZ)
+
+def fmt_slot(s: datetime):
+    giorni = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
+    return f"{giorni[s.weekday()]} {s.strftime('%d/%m %H:%M')}"
+
+def normalize_time(text: str) -> str | None:
+    t = text.lower().strip()
+    # 18:30 o 18.30
+    m = re.search(r'(\d{1,2})[:\.](\d{2})', t)
+    if m:
+        hh = int(m.group(1)); mm = int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+    # solo ora: "18"
+    m = re.search(r'\b(\d{1,2})\b', t)
+    if m:
+        hh = int(m.group(1))
+        if 0 <= hh <= 23:
+            return f"{hh:02d}:00"
+    return None
+
+def parse_day_simple(text: str) -> date | None:
+    low = text.lower()
+    today = now().date()
+    if "oggi" in low:
+        return today
+    if "domani" in low:
+        return today + timedelta(days=1)
+
+    # dd/mm oppure dd-mm
+    m = re.search(r'\b(\d{1,2})[\/\-](\d{1,2})\b', low)
+    if m:
+        dd = int(m.group(1)); mm = int(m.group(2))
+        yy = today.year
+        try:
+            d = date(yy, mm, dd)
+            # se già passato, prova anno prossimo
+            if d < today:
+                d = date(yy + 1, mm, dd)
+            return d
+        except Exception:
+            return None
+    return None
 
 def iter_slots_for_day(d: date):
     wd = d.weekday()
@@ -90,7 +147,7 @@ def is_free(start_dt: datetime, end_dt: datetime) -> bool:
     busy = fb.get("calendars", {}).get(CALENDAR_ID, {}).get("busy", [])
     return len(busy) == 0
 
-def create_calendar_event(phone: str, start_dt: datetime, end_dt: datetime):
+def create_event(phone: str, start_dt: datetime, end_dt: datetime):
     event = {
         "summary": SERVICE_NAME,
         "description": f"Cliente WhatsApp: {phone}",
@@ -99,13 +156,14 @@ def create_calendar_event(phone: str, start_dt: datetime, end_dt: datetime):
     }
     calendar.events().insert(calendarId=CALENDAR_ID, body=event).execute()
 
-def find_next_free_slots(preferred_date: date | None, max_days=14, limit=6):
+def find_free_slots(preferred_date: date | None, max_days=14, limit=6):
     slots = []
-    start_day = preferred_date if preferred_date else datetime.now(TZ).date()
+    start_day = preferred_date if preferred_date else now().date()
     for day_offset in range(0, max_days):
         d = start_day + timedelta(days=day_offset)
         for s, e in iter_slots_for_day(d):
-            if s <= datetime.now(TZ) + timedelta(minutes=2):
+            # evita slot nel passato / troppo imminenti
+            if s <= now() + timedelta(minutes=2):
                 continue
             if is_free(s, e):
                 slots.append((s, e))
@@ -113,169 +171,252 @@ def find_next_free_slots(preferred_date: date | None, max_days=14, limit=6):
                     return slots
     return slots
 
-def fmt_slot(s: datetime):
-    giorni = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
-    return f"{giorni[s.weekday()]} {s.strftime('%d/%m %H:%M')}"
+def first_free_at_time(d: date, hhmm: str):
+    # cerca esattamente slot HH:MM nel giorno d
+    try:
+        hh, mm = hhmm.split(":")
+        s = combine(d, time(int(hh), int(mm)))
+        e = s + timedelta(minutes=SLOT_MINUTES)
+        # verifica che sia dentro orario di apertura
+        ok_open = False
+        for a, b in OPENING.get(d.weekday(), []):
+            if combine(d, a) <= s and e <= combine(d, b):
+                ok_open = True
+                break
+        if not ok_open:
+            return None
+        if s <= now() + timedelta(minutes=2):
+            return None
+        return (s, e) if is_free(s, e) else None
+    except Exception:
+        return None
 
 # =========================
-# GPT: SOLO ESTRAZIONE DATI
+# GPT: solo per capire intent generale
 # =========================
 SYSTEM_GPT = """
 Sei un assistente WhatsApp per PARRUCCHIERE UOMO.
-Obiettivo: prenotare TAGLIO UOMO (slot 30 minuti) e rispondere su disponibilità/orari.
-Non parlare di altri servizi.
-Devi estrarre SOLO:
-- intent (book/info/other)
-- preferred_day (today/tomorrow/date:YYYY-MM-DD/null)
-- preferred_time (HH:MM/null)
-Rispondi SOLO con JSON valido.
+Devi capire SOLO l'intento:
+- book: vuole prenotare / disponibilità / appuntamento / posto / quando sei libero
+- info: chiede orari/indirizzo/regole
+- other: altro
+Rispondi SOLO JSON: {"intent":"book|info|other"}
 """
 
-def gpt_parse(user_text: str):
-    prompt = f"""
-Testo cliente: {user_text}
-
-Regole:
-- Se chiede appuntamento/prenotare/posto/orario -> intent="book"
-- Se chiede solo orari -> intent="info"
-- Altrimenti -> intent="other"
-
-preferred_day:
-- "today" se oggi
-- "tomorrow" se domani
-- "date:YYYY-MM-DD" se specifica data
-- null se non specifica
-
-preferred_time:
-- "HH:MM" se specifica un orario (es. 18, 18:00, alle 15 e 30)
-- null se non specifica
-
-Rispondi SOLO JSON.
-"""
+def gpt_intent(text: str) -> str:
     try:
         r = client.chat.completions.create(
             model=MODEL,
-            messages=[{"role": "system", "content": SYSTEM_GPT},
-                      {"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=120,
+            messages=[
+                {"role": "system", "content": SYSTEM_GPT},
+                {"role": "user", "content": f"Testo: {text}\nRispondi SOLO JSON."},
+            ],
+            temperature=0.0,
+            max_tokens=40,
         )
-        return json.loads(r.choices[0].message.content.strip())
+        obj = json.loads(r.choices[0].message.content.strip())
+        return (obj.get("intent") or "other").lower()
     except Exception:
-        return {"intent": "other", "preferred_day": None, "preferred_time": None}
-
-def normalize_time(text: str) -> str | None:
-    """
-    Accetta: '18', '18:00', 'alle 18', 'ore 18', '18.30', '18 30'
-    Ritorna 'HH:MM' o None
-    """
-    t = text.lower().strip()
-    # 18:30 o 18.30
-    m = re.search(r'(\d{1,2})[:\.](\d{2})', t)
-    if m:
-        hh = int(m.group(1)); mm = int(m.group(2))
-        if 0 <= hh <= 23 and 0 <= mm <= 59:
-            return f"{hh:02d}:{mm:02d}"
-    # solo ora: "18"
-    m = re.search(r'\b(\d{1,2})\b', t)
-    if m:
-        hh = int(m.group(1))
-        if 0 <= hh <= 23:
-            return f"{hh:02d}:00"
-    return None
+        # fallback semplice
+        low = text.lower()
+        if any(k in low for k in ["prenot", "appunt", "posto", "dispon", "quando", "domani", "oggi", "taglio"]):
+            return "book"
+        if any(k in low for k in ["orari", "aperto", "chiuso"]):
+            return "info"
+        return "other"
 
 # =========================
-# WEBHOOK WHATSAPP
+# MESSAGGI UTILI
+# =========================
+def msg_welcome():
+    return (
+        "Ciao! Io gestisco solo le prenotazioni per *taglio uomo* 💈\n"
+        "Scrivimi ad esempio: *“Vorrei prenotare un taglio”* oppure *“Hai posto domani?”*."
+    )
+
+def msg_hours():
+    return (
+        "Orari:\n"
+        "- Mar–Ven: 08:30–12:00 e 15:00–18:00\n"
+        "- Sab: 08:30–13:00 e 15:00–18:00\n"
+        "- Lun/Dom: chiuso\n\n"
+        "Vuoi prenotare un *taglio uomo*? Dimmi quando preferisci 😊"
+    )
+
+# =========================
+# WEBHOOK
 # =========================
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
     from_number = request.form.get("From", "")
     user_message = (request.form.get("Body", "") or "").strip()
+    text = user_message.lower().strip()
 
-    sess = SESSIONS.get(from_number, {"state": "idle", "history": []})
-    sess["history"].append(user_message)
-    sess["history"] = sess["history"][-12:]
-
+    sess = SESSIONS.get(from_number, {"state": IDLE})
     resp = MessagingResponse()
 
-    # --- Stato: in attesa di scelta 1/2/3 ---
-    if sess.get("state") == "await_pick":
-        low = user_message.strip().lower()
-        if low in {"1", "2", "3"} and sess.get("proposed"):
-            idx = int(low) - 1
+    # 0) comandi veloci
+    if text in {"reset", "ricomincia"}:
+        SESSIONS[from_number] = {"state": IDLE}
+        resp.message("Ok 👍 ricominciamo. " + msg_welcome())
+        return str(resp)
+
+    # 1) stato: scelta 1/2/3
+    if sess.get("state") == OFFER_PICK:
+        if text in {"1", "2", "3"} and sess.get("proposed"):
+            idx = int(text) - 1
             if 0 <= idx < len(sess["proposed"]):
                 chosen = sess["proposed"][idx]
                 start_dt = datetime.fromisoformat(chosen["start"])
+                sess["chosen"] = chosen
+                sess["state"] = CONFIRM
+                SESSIONS[from_number] = sess
                 resp.message(
                     f"Confermi questo appuntamento?\n"
                     f"💈 {SERVICE_NAME}\n"
                     f"🕒 {fmt_slot(start_dt)}\n\n"
                     "Rispondi *OK* per confermare oppure *annulla*."
                 )
-                sess["state"] = "await_confirm"
-                sess["chosen"] = chosen
-                SESSIONS[from_number] = sess
                 return str(resp)
         resp.message("Per favore rispondi con *1*, *2* o *3* 🙂")
         SESSIONS[from_number] = sess
         return str(resp)
 
-    # --- Stato: in attesa conferma ---
-    if sess.get("state") == "await_confirm":
-        low = user_message.lower().strip()
-        if any(w in low for w in CANCEL_WORDS):
-            sess["state"] = "idle"
+    # 2) stato: conferma finale
+    if sess.get("state") == CONFIRM:
+        if any(w in text for w in NEGATIVE_WORDS):
+            sess["state"] = ASK_ALTERNATIVE
             sess.pop("chosen", None)
             SESSIONS[from_number] = sess
-            resp.message("Ok 👍 annullato. Vuoi che ti proponga altri orari?")
+            resp.message("Ok 👍 Nessun problema. Vuoi che ti proponga altri orari disponibili?")
             return str(resp)
 
-        if any(w in low for w in CONFIRM_WORDS):
+        if any(w in text for w in CONFIRM_WORDS):
             chosen = sess.get("chosen")
-            if chosen:
-                start_dt = datetime.fromisoformat(chosen["start"])
-                end_dt = datetime.fromisoformat(chosen["end"])
-                # ultimo controllo
-                if is_free(start_dt, end_dt):
-                    create_calendar_event(from_number, start_dt, end_dt)
-                    sess["state"] = "idle"
+            if not chosen:
+                sess["state"] = IDLE
+                SESSIONS[from_number] = sess
+                resp.message("Mi sono perso lo slot 😅 Vuoi che ti proponga di nuovo gli orari disponibili?")
+                return str(resp)
+
+            start_dt = datetime.fromisoformat(chosen["start"])
+            end_dt = datetime.fromisoformat(chosen["end"])
+
+            try:
+                # ultimo controllo (evita doppie prenotazioni)
+                if not is_free(start_dt, end_dt):
+                    sess["state"] = ASK_ALTERNATIVE
                     sess.pop("chosen", None)
                     SESSIONS[from_number] = sess
-                    resp.message(
-                        f"✅ Appuntamento confermato!\n"
-                        f"💈 {SERVICE_NAME}\n"
-                        f"🕒 {fmt_slot(start_dt)}\n\n"
-                        "A presto 👋"
-                    )
+                    resp.message("Ops, quello slot è appena stato occupato. Vuoi che ti proponga altri orari?")
                     return str(resp)
-                else:
-                    sess["state"] = "idle"
-                    sess.pop("chosen", None)
-                    SESSIONS[from_number] = sess
-                    resp.message("Ops, quello slot è appena stato occupato. Vuoi che ti proponga i prossimi disponibili?")
-                    return str(resp)
+
+                create_event(from_number, start_dt, end_dt)
+
+                sess["state"] = IDLE
+                sess.pop("chosen", None)
+                SESSIONS[from_number] = sess
+                resp.message(
+                    f"✅ Appuntamento confermato!\n"
+                    f"💈 {SERVICE_NAME}\n"
+                    f"🕒 {fmt_slot(start_dt)}\n\n"
+                    "A presto 👋"
+                )
+                return str(resp)
+
+            except HttpError as e:
+                sess["state"] = IDLE
+                SESSIONS[from_number] = sess
+                resp.message("Ho un problema tecnico con il calendario. Riprova tra poco, per favore.")
+                return str(resp)
 
         resp.message("Vuoi confermare lo slot? Rispondi *OK* oppure *annulla*.")
         SESSIONS[from_number] = sess
         return str(resp)
 
-    # --- Se l'utente manda solo un orario tipo "alle 18" ---
-    # e prima aveva chiesto domani/posto -> usiamo il contesto salvato
-    maybe_time = normalize_time(user_message)
-    if maybe_time and sess.get("pending_day"):
-        # prova a cercare esattamente quell'orario nel giorno pending_day
-        preferred_date = sess["pending_day"]
-        slots = find_next_free_slots(preferred_date=preferred_date, max_days=1, limit=30)
-        exact = []
-        for s, e in slots:
-            if s.date() == preferred_date and s.strftime("%H:%M") == maybe_time:
-                exact.append((s, e))
-                break
+    # 3) stato: vuoi alternative?
+    if sess.get("state") == ASK_ALTERNATIVE:
+        if any(w in text for w in YES_WORDS):
+            # proponi 3 slot prossimi
+            preferred_date = sess.get("preferred_date")
+            slots = []
+            try:
+                slots = find_free_slots(preferred_date=preferred_date, max_days=14, limit=6)
+            except HttpError:
+                sess["state"] = IDLE
+                SESSIONS[from_number] = sess
+                resp.message("Ho un problema tecnico con il calendario. Riprova tra poco.")
+                return str(resp)
+
+            if not slots:
+                sess["state"] = IDLE
+                SESSIONS[from_number] = sess
+                resp.message("Non trovo disponibilità nei prossimi giorni. Vuoi indicarmi un giorno specifico?")
+                return str(resp)
+
+            propose = slots[:3]
+            lines = ["Perfetto 💈 Ecco i prossimi orari liberi (30 minuti):"]
+            for i, (s, e) in enumerate(propose, start=1):
+                lines.append(f"{i}) {fmt_slot(s)}")
+            lines.append("\nRispondi con *1*, *2* o *3* oppure scrivimi un orario (es. 17:30).")
+            resp.message("\n".join(lines))
+
+            sess["state"] = OFFER_PICK
+            sess["proposed"] = [{"start": s.isoformat(), "end": e.isoformat()} for s, e in propose]
+            SESSIONS[from_number] = sess
+            return str(resp)
+
+        if any(w in text for w in NEGATIVE_WORDS):
+            sess["state"] = IDLE
+            SESSIONS[from_number] = sess
+            resp.message("Ok 👍 Dimmi tu un giorno e un orario che preferisci e vediamo la disponibilità.")
+            return str(resp)
+
+        resp.message("Vuoi che ti proponga altri orari? Rispondi *OK* oppure *no*.")
+        SESSIONS[from_number] = sess
+        return str(resp)
+
+    # 4) stato: sto aspettando il giorno
+    if sess.get("state") == ASK_DAY:
+        d = parse_day_simple(user_message)
+        if not d:
+            resp.message("Perfetto 👍 Che giorno preferisci? (es. *domani*, *oggi*, oppure *16/12*)")
+            SESSIONS[from_number] = sess
+            return str(resp)
+
+        sess["preferred_date"] = d
+        sess["state"] = ASK_TIME
+        SESSIONS[from_number] = sess
+        resp.message("A che ora preferisci? (es. 15:00, 17:30, 18:00)")
+        return str(resp)
+
+    # 5) stato: sto aspettando l'orario
+    if sess.get("state") == ASK_TIME:
+        hhmm = normalize_time(user_message)
+        if not hhmm:
+            resp.message("Dimmi un orario valido (es. 15:00, 17:30, 18:00).")
+            SESSIONS[from_number] = sess
+            return str(resp)
+
+        d = sess.get("preferred_date")
+        if not d:
+            sess["state"] = ASK_DAY
+            SESSIONS[from_number] = sess
+            resp.message("Ok 👍 Per che giorno?")
+            return str(resp)
+
+        try:
+            exact = first_free_at_time(d, hhmm)
+        except HttpError:
+            sess["state"] = IDLE
+            SESSIONS[from_number] = sess
+            resp.message("Ho un problema tecnico con il calendario. Riprova tra poco.")
+            return str(resp)
+
         if exact:
-            s, e = exact[0]
-            sess["state"] = "await_confirm"
+            s, e = exact
             sess["chosen"] = {"start": s.isoformat(), "end": e.isoformat()}
-            sess.pop("pending_day", None)
+            sess["state"] = CONFIRM
             SESSIONS[from_number] = sess
             resp.message(
                 f"Perfetto! Confermi:\n"
@@ -285,95 +426,87 @@ def whatsapp():
             )
             return str(resp)
         else:
-            # non esiste quello slot libero
-            sess.pop("pending_day", None)
+            # non disponibile: proponi alternative
+            sess["state"] = ASK_ALTERNATIVE
             SESSIONS[from_number] = sess
             resp.message("A quell’ora non ho disponibilità. Vuoi che ti proponga i prossimi orari liberi?")
             return str(resp)
 
-    # --- Parsing intent con GPT (solo per capire cosa vuole) ---
-    parsed = gpt_parse(user_message)
-    intent = (parsed.get("intent") or "other").lower()
+    # =========================
+    # STATO IDLE: capiamo cosa vuole
+    # =========================
+    intent = gpt_intent(user_message)
 
     if intent == "info":
-        resp.message(
-            "Orari:\n"
-            "- Mar–Ven: 08:30–12:00 e 15:00–18:00\n"
-            "- Sab: 08:30–13:00 e 15:00–18:00\n"
-            "- Lun/Dom: chiuso\n\n"
-            "Vuoi prenotare un *taglio uomo*? Dimmi quando preferisci 😊"
-        )
+        resp.message(msg_hours())
+        sess["state"] = IDLE
         SESSIONS[from_number] = sess
         return str(resp)
 
     if intent != "book":
-        resp.message(
-            "Ciao! Io gestisco solo le *prenotazioni per taglio uomo* 💈\n"
-            "Scrivimi: *“Vorrei prenotare un taglio”* oppure *“Hai posto domani?”*."
-        )
+        resp.message(msg_welcome())
+        sess["state"] = IDLE
         SESSIONS[from_number] = sess
         return str(resp)
 
-    # booking: calcolo preferred_date
-    pref_day = parsed.get("preferred_day")
-    today = datetime.now(TZ).date()
-    preferred_date = None
-    if pref_day == "today":
-        preferred_date = today
-    elif pref_day == "tomorrow":
-        preferred_date = today + timedelta(days=1)
-    elif isinstance(pref_day, str) and pref_day.startswith("date:"):
-        try:
-            preferred_date = datetime.strptime(pref_day.split("date:")[1], "%Y-%m-%d").date()
-        except Exception:
-            preferred_date = None
+    # intent = booking: prova a capire se ha già indicato giorno e/o ora
+    d = parse_day_simple(user_message)
+    hhmm = normalize_time(user_message)
 
-    # Se chiede "domani" ma non dà orario, chiediamo l'ora (e memorizziamo il giorno)
-    if preferred_date and not parsed.get("preferred_time"):
-        sess["pending_day"] = preferred_date
+    # Caso A: ha scritto solo "domani" o una data
+    if d and not hhmm:
+        sess["preferred_date"] = d
+        sess["state"] = ASK_TIME
         SESSIONS[from_number] = sess
         resp.message("Certo 👍 A che ora preferisci? (es. 15:00, 17:30, 18:00)")
         return str(resp)
 
-    # Se ha dato anche un orario, proviamo a proporre slot coerenti
-    preferred_time = parsed.get("preferred_time")
-    if preferred_time and preferred_date:
-        # Proviamo a vedere se quello slot esiste ed è libero
-        slots = find_next_free_slots(preferred_date=preferred_date, max_days=1, limit=30)
-        for s, e in slots:
-            if s.date() == preferred_date and s.strftime("%H:%M") == preferred_time:
-                sess["state"] = "await_confirm"
-                sess["chosen"] = {"start": s.isoformat(), "end": e.isoformat()}
-                SESSIONS[from_number] = sess
-                resp.message(
-                    f"Perfetto! Confermi:\n"
-                    f"💈 {SERVICE_NAME}\n"
-                    f"🕒 {fmt_slot(s)}\n\n"
-                    "Rispondi *OK* per confermare oppure *annulla*."
-                )
-                return str(resp)
-
-        resp.message("A quell’ora non ho disponibilità. Vuoi che ti proponga i prossimi orari liberi?")
+    # Caso B: ha scritto solo un orario (senza giorno)
+    if hhmm and not d:
+        sess["state"] = ASK_DAY
         SESSIONS[from_number] = sess
+        resp.message("Perfetto 👍 Per che giorno? (es. domani, 16/12)")
         return str(resp)
 
-    # Altrimenti proponi i prossimi 3 slot disponibili
-    slots = find_next_free_slots(preferred_date=preferred_date, max_days=14, limit=6)
-    if not slots:
-        resp.message("Non trovo disponibilità nei prossimi giorni. Vuoi indicarmi un giorno specifico?")
+    # Caso C: ha scritto giorno + ora insieme
+    if d and hhmm:
+        sess["preferred_date"] = d
+        sess["state"] = ASK_TIME  # riusiamo la stessa logica
         SESSIONS[from_number] = sess
-        return str(resp)
+        # simuliamo come se stesse rispondendo all'orario
+        # (chiamiamo ricorsivamente la parte ASK_TIME)
+        # più semplice: settiamo e facciamo check subito
+        try:
+            exact = first_free_at_time(d, hhmm)
+        except HttpError:
+            sess["state"] = IDLE
+            SESSIONS[from_number] = sess
+            resp.message("Ho un problema tecnico con il calendario. Riprova tra poco.")
+            return str(resp)
 
-    propose = slots[:3]
-    lines = ["Perfetto 💈 Ecco i primi orari disponibili (slot 30 minuti):"]
-    for i, (s, e) in enumerate(propose, start=1):
-        lines.append(f"{i}) {fmt_slot(s)}")
-    lines.append("\nRispondi con *1*, *2* o *3* per scegliere.")
-    resp.message("\n".join(lines))
+        if exact:
+            s, e = exact
+            sess["chosen"] = {"start": s.isoformat(), "end": e.isoformat()}
+            sess["state"] = CONFIRM
+            SESSIONS[from_number] = sess
+            resp.message(
+                f"Perfetto! Confermi:\n"
+                f"💈 {SERVICE_NAME}\n"
+                f"🕒 {fmt_slot(s)}\n\n"
+                "Rispondi *OK* per confermare oppure *annulla*."
+            )
+            return str(resp)
+        else:
+            sess["preferred_date"] = d
+            sess["state"] = ASK_ALTERNATIVE
+            SESSIONS[from_number] = sess
+            resp.message("A quell’ora non ho disponibilità. Vuoi che ti proponga i prossimi orari liberi?")
+            return str(resp)
 
-    sess["state"] = "await_pick"
-    sess["proposed"] = [{"start": s.isoformat(), "end": e.isoformat()} for s, e in propose]
+    # Caso D: booking generico ("vorrei prenotare")
+    sess["state"] = ASK_DAY
     SESSIONS[from_number] = sess
+    resp.message("Perfetto 💈 Che giorno preferisci? (es. domani, 16/12)")
     return str(resp)
 
 @app.route("/")
