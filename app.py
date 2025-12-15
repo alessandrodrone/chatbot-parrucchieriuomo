@@ -1,194 +1,232 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 import os, json, re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import pytz
 
-app = Flask(__name__)
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # =========================
-# CONFIG BASE
+# CONFIG
 # =========================
 TIMEZONE = pytz.timezone("Europe/Rome")
 SLOT_MINUTES = 30
 
 WORKING_HOURS = {
-    0: [],  # lunedì chiuso
-    1: [(8,30,12,0), (15,0,18,0)],
-    2: [(8,30,12,0), (15,0,18,0)],
-    3: [(8,30,12,0), (15,0,18,0)],
-    4: [(8,30,12,0), (15,0,18,0)],
-    5: [(8,30,13,0), (15,0,18,0)],
-    6: []   # domenica chiuso
+    0: [],                     # lunedì chiuso
+    1: [(9, 0, 19, 30)],       # martedì
+    2: [(9, 30, 21, 30)],      # mercoledì
+    3: [(9, 0, 19, 30)],       # giovedì
+    4: [(9, 30, 21, 30)],      # venerdì
+    5: [(10, 0, 19, 0)],       # sabato
+    6: []                      # domenica chiuso
 }
-
-# =========================
-# MEMORIA BREVE (SESSIONI)
-# =========================
-SESSIONS = {}
 
 # =========================
 # GOOGLE CALENDAR
 # =========================
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-GOOGLE_CREDS = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-if not GOOGLE_CALENDAR_ID or not GOOGLE_CREDS:
-    raise RuntimeError("Variabili Google Calendar mancanti")
+SERVICE_ACCOUNT_INFO = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 
 creds = service_account.Credentials.from_service_account_info(
-    json.loads(GOOGLE_CREDS),
+    SERVICE_ACCOUNT_INFO,
     scopes=["https://www.googleapis.com/auth/calendar"]
 )
 
 calendar = build("calendar", "v3", credentials=creds)
 
 # =========================
+# APP
+# =========================
+app = Flask(__name__)
+
+SESSIONS = {}
+
+# =========================
 # UTILS
 # =========================
-def parse_time(text):
-    match = re.search(r"(\d{1,2})[:\.](\d{2})", text)
-    if match:
-        h, m = int(match.group(1)), int(match.group(2))
-        if 0 <= h < 24 and m in (0,30):
-            return h, m
+def parse_date(text):
+    text = text.lower().strip()
+
+    if "domani" in text:
+        return datetime.now(TIMEZONE).date() + timedelta(days=1)
+
+    m = re.search(r"(\d{1,2})/(\d{1,2})", text)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = datetime.now().year
+        return datetime(year, month, day).date()
+
     return None
 
-def get_day_ranges(date):
-    ranges = []
-    for sh, sm, eh, em in WORKING_HOURS[date.weekday()]:
-        start = TIMEZONE.localize(datetime(date.year, date.month, date.day, sh, sm))
-        end = TIMEZONE.localize(datetime(date.year, date.month, date.day, eh, em))
-        ranges.append((start, end))
-    return ranges
 
-def is_free(start, end):
+def parse_time(text):
+    m = re.search(r"(\d{1,2})[:\.](\d{2})", text)
+    if m:
+        return time(int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def get_working_slots(date):
+    weekday = date.weekday()
+    ranges = WORKING_HOURS.get(weekday, [])
+    slots = []
+
+    for h1, m1, h2, m2 in ranges:
+        start = datetime.combine(date, time(h1, m1, tzinfo=TIMEZONE))
+        end = datetime.combine(date, time(h2, m2, tzinfo=TIMEZONE))
+
+        while start + timedelta(minutes=SLOT_MINUTES) <= end:
+            slots.append(start)
+            start += timedelta(minutes=SLOT_MINUTES)
+
+    return slots
+
+
+def is_free(start):
+    end = start + timedelta(minutes=SLOT_MINUTES)
     body = {
         "timeMin": start.isoformat(),
         "timeMax": end.isoformat(),
         "items": [{"id": GOOGLE_CALENDAR_ID}]
     }
-    fb = calendar.freebusy().query(body=body).execute()
-    return len(fb["calendars"][GOOGLE_CALENDAR_ID]["busy"]) == 0
 
-def next_free_slots(day, limit=5):
+    fb = calendar.freebusy().query(body=body).execute()
+    return not fb["calendars"][GOOGLE_CALENDAR_ID]["busy"]
+
+
+def find_free_slots(date, limit=5):
     slots = []
-    for start_range, end_range in get_day_ranges(day):
-        cur = start_range
-        while cur + timedelta(minutes=SLOT_MINUTES) <= end_range:
-            end = cur + timedelta(minutes=SLOT_MINUTES)
-            if is_free(cur, end):
-                slots.append(cur)
-                if len(slots) >= limit:
-                    return slots
-            cur += timedelta(minutes=SLOT_MINUTES)
+    for s in get_working_slots(date):
+        if is_free(s):
+            slots.append(s)
+        if len(slots) >= limit:
+            break
     return slots
 
+
+def format_slots(slots):
+    out = []
+    for i, s in enumerate(slots, 1):
+        out.append(f"{i}) {s.strftime('%d/%m %H:%M')}")
+    return "\n".join(out)
+
+
 def create_event(start):
-    end = start + timedelta(minutes=SLOT_MINUTES)
     event = {
-        "summary": "Taglio uomo",
-        "start": {"dateTime": start.isoformat()},
-        "end": {"dateTime": end.isoformat()}
+        "summary": "Taglio uomo 💈",
+        "start": {"dateTime": start.isoformat(), "timeZone": "Europe/Rome"},
+        "end": {"dateTime": (start + timedelta(minutes=30)).isoformat(), "timeZone": "Europe/Rome"},
     }
     calendar.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
 
 # =========================
-# WHATSAPP WEBHOOK
+# WHATSAPP
 # =========================
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
     from_number = request.form.get("From")
-    text = request.form.get("Body", "").lower().strip()
+    msg = request.form.get("Body", "").strip().lower()
 
     session = SESSIONS.get(from_number, {})
 
-    # SALUTO / RESET
-    if text in ("ciao", "buongiorno", "salve"):
-        SESSIONS[from_number] = {}
-        return reply(
-            "Ciao! 💈 Gestisco le prenotazioni per *taglio uomo*.\n"
-            "Scrivimi ad esempio:\n"
+    # START
+    if not session:
+        SESSIONS[from_number] = {"state": "idle"}
+        r = MessagingResponse()
+        r.message(
+            "Ciao! Io gestisco solo le prenotazioni per taglio uomo 💈\n"
+            "Scrivimi:\n"
             "- “Hai posto domani?”\n"
             "- “Vorrei prenotare un taglio”"
         )
+        return str(r)
 
-    # SE ASPETTA CONFERMA
-    if session.get("state") == "confirm":
-        if text in ("ok", "confermo", "va bene"):
-            create_event(session["slot"])
-            SESSIONS[from_number] = {}
-            return reply(
-                f"✅ Appuntamento confermato!\n"
-                f"💈 Taglio uomo\n"
-                f"🕒 {session['slot'].strftime('%d/%m %H:%M')}\n\n"
-                "A presto 👋"
-            )
-        else:
-            SESSIONS[from_number] = {}
-            return reply("Nessun problema! Scrivimi quando vuoi prenotare 😊")
-
-    # ORARIO DIRETTO
-    t = parse_time(text)
-    if t:
-        h, m = t
-        day = datetime.now(TIMEZONE).date() + timedelta(days=1)
-        slot = TIMEZONE.localize(datetime(day.year, day.month, day.day, h, m))
-        if is_free(slot, slot + timedelta(minutes=30)):
-            session["slot"] = slot
-            session["state"] = "confirm"
-            SESSIONS[from_number] = session
-            return reply(
-                f"Confermi questo appuntamento?\n"
-                f"💈 Taglio uomo\n"
-                f"🕒 {slot.strftime('%d/%m %H:%M')}\n\n"
-                "Rispondi OK per confermare"
-            )
-        else:
-            return reply("A quell’ora non ho posto. Vuoi che ti proponga alternative?")
-
-    # RICHIESTA DISPONIBILITÀ
-    if "posto" in text or "prenot" in text:
-        day = datetime.now(TIMEZONE).date() + timedelta(days=1)
-        slots = next_free_slots(day)
+    # DATE
+    date = parse_date(msg)
+    if date:
+        slots = find_free_slots(date)
         if not slots:
-            return reply("Domani sono pieno 😕 Vuoi vedere dopodomani?")
-        session["slots"] = slots
-        SESSIONS[from_number] = session
-        msg = "Ecco i prossimi orari liberi:\n"
-        for i,s in enumerate(slots,1):
-            msg += f"{i}) {s.strftime('%d/%m %H:%M')}\n"
-        msg += "\nRispondi con il numero oppure scrivi un orario."
-        return reply(msg)
+            r = MessagingResponse()
+            r.message("Quel giorno non ho disponibilità. Vuoi un altro giorno?")
+            return str(r)
 
-    # SCELTA NUMERO
-    if text.isdigit() and session.get("slots"):
-        idx = int(text)-1
-        if 0 <= idx < len(session["slots"]):
-            slot = session["slots"][idx]
-            session["slot"] = slot
-            session["state"] = "confirm"
-            SESSIONS[from_number] = session
-            return reply(
-                f"Confermi questo appuntamento?\n"
-                f"💈 Taglio uomo\n"
-                f"🕒 {slot.strftime('%d/%m %H:%M')}\n\n"
-                "Rispondi OK per confermare"
-            )
+        session.update({"state": "choose_slot", "date": date, "slots": slots})
+        r = MessagingResponse()
+        r.message(
+            f"Ecco gli orari liberi:\n{format_slots(slots)}\n\n"
+            "Rispondi con il numero oppure scrivi un orario (es. 18:00)."
+        )
+        return str(r)
 
-    return reply(
+    # SLOT SELECTION
+    if session.get("state") == "choose_slot":
+        slots = session["slots"]
+
+        if msg.isdigit():
+            i = int(msg) - 1
+            if 0 <= i < len(slots):
+                session["selected"] = slots[i]
+                session["state"] = "confirm"
+            else:
+                r = MessagingResponse()
+                r.message("Numero non valido.")
+                return str(r)
+
+        else:
+            t = parse_time(msg)
+            if t:
+                for s in slots:
+                    if s.time() == t:
+                        session["selected"] = s
+                        session["state"] = "confirm"
+                        break
+
+        if session.get("state") != "confirm":
+            r = MessagingResponse()
+            r.message("Per favore rispondi con il numero oppure un orario valido.")
+            return str(r)
+
+        s = session["selected"]
+        r = MessagingResponse()
+        r.message(
+            f"Confermi questo appuntamento?\n"
+            f"💈 Taglio uomo\n"
+            f"🕒 {s.strftime('%d/%m %H:%M')}\n\n"
+            "Rispondi OK per confermare"
+        )
+        return str(r)
+
+    # CONFIRM
+    if session.get("state") == "confirm" and msg in ["ok", "si", "sì"]:
+        create_event(session["selected"])
+        SESSIONS.pop(from_number, None)
+
+        r = MessagingResponse()
+        r.message(
+            "✅ Appuntamento confermato!\n"
+            "💈 Taglio uomo\n"
+            f"🕒 {session['selected'].strftime('%d/%m %H:%M')}\n\n"
+            "A presto 👋"
+        )
+        return str(r)
+
+    # FALLBACK
+    r = MessagingResponse()
+    r.message(
         "Scrivimi ad esempio:\n"
         "- “Hai posto domani?”\n"
         "- “Vorrei prenotare un taglio”"
     )
-
-def reply(text):
-    r = MessagingResponse()
-    r.message(text)
     return str(r)
+
 
 @app.route("/")
 def home():
     return "Chatbot parrucchiere attivo ✅"
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
