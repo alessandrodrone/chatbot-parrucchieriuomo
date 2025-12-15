@@ -1,85 +1,62 @@
-from flask import Flask, request
-from twilio.twiml.messaging_response import MessagingResponse
+from __future__ import annotations
+
 import os
 import re
 import json
-from datetime import datetime, timedelta, time, date
-from zoneinfo import ZoneInfo
+import datetime as dt
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Dict
+
+from flask import Flask, request
+from twilio.twiml.messaging_response import MessagingResponse
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-app = Flask(__name__)
+try:
+    # Python 3.9+
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None  # fallback (ma su Railway di solito va)
 
-TZ = ZoneInfo("Europe/Rome")
+
+# =========================
+# CONFIG
+# =========================
+APP_TZ = "Europe/Rome"
+TZ = ZoneInfo(APP_TZ) if ZoneInfo else None
+
+SERVICE_NAME = "Taglio uomo"
 SLOT_MINUTES = 30
 
-# =========================
-# ORARI REALI PARRUCCHIERE
-# =========================
-# 0=Lun ... 6=Dom
-# lista di fasce (start, end) in orario locale
-OPEN_HOURS = {
-    0: [],  # Lun chiuso
-    1: [(time(9, 0), time(19, 30))],     # Mar
-    2: [(time(9, 30), time(21, 30))],    # Mer
-    3: [(time(9, 0), time(19, 30))],     # Gio
-    4: [(time(9, 30), time(21, 30))],    # Ven
-    5: [(time(10, 0), time(19, 0))],     # Sab
-    6: [],  # Dom chiuso
+# Orari REALI del negozio:
+# lunedì: chiuso
+# martedì: 09–19:30
+# mercoledì: 09:30–21:30
+# giovedì: 09–19:30
+# venerdì: 09:30–21:30
+# sabato: 10–19
+# domenica: chiuso
+BUSINESS_HOURS = {
+    0: [],  # lun
+    1: [("09:00", "19:30")],  # mar
+    2: [("09:30", "21:30")],  # mer
+    3: [("09:00", "19:30")],  # gio
+    4: [("09:30", "21:30")],  # ven
+    5: [("10:00", "19:00")],  # sab
+    6: [],  # dom
 }
 
-CONFIRM_WORDS = {"ok", "okay", "va bene", "confermo", "si", "sì", "perfetto"}
-CANCEL_WORDS = {"annulla", "no", "cancella", "stop"}
+# parole chiave
+CONFIRM_WORDS = {"ok", "va bene", "confermo", "conferma", "sì", "si", "perfetto", "certo"}
+CANCEL_WORDS = {"annulla", "cancella", "stop", "no", "non va bene", "non confermo"}
 
-# =========================
-# SESSIONI (memoria breve)
-# =========================
-SESSIONS = {}
+BOOKING_HINTS = {"prenota", "prenotare", "appuntamento", "taglio", "posto", "disponibile", "disponibilità", "hai posto"}
+AVAILABILITY_HINTS = {"hai posto", "disponibilità", "disponibile", "posto"}
 
-# =========================
-# GOOGLE CALENDAR
-# =========================
-def get_calendar_service():
-    # Preferisci variabile JSON
-    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if raw:
-        info = json.loads(raw)
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/calendar"]
-        )
-        return build("calendar", "v3", credentials=creds)
-
-    # Fallback: file credentials.json (se presente nel repo)
-    if os.path.exists("credentials.json"):
-        creds = service_account.Credentials.from_service_account_file(
-            "credentials.json", scopes=["https://www.googleapis.com/auth/calendar"]
-        )
-        return build("calendar", "v3", credentials=creds)
-
-    raise RuntimeError(
-        "Manca Google Service Account. Imposta GOOGLE_SERVICE_ACCOUNT_JSON su Railway "
-        "oppure carica credentials.json nel progetto."
-    )
-
-CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
-if not CALENDAR_ID:
-    # Non crashare: rispondiamo con messaggio in chat se manca
-    CALENDAR_ID = None
-
-calendar = None
-try:
-    calendar = get_calendar_service()
-except Exception:
-    calendar = None
-
-
-# =========================
-# PARSING ITALIANO SEMPLICE
-# =========================
-WEEKDAY_MAP = {
-    "lunedì": 0, "lunedi": 0,
+WEEKDAYS_IT = {
+    "lunedì": 0, "lunedi": 0, "lun": 0,
     "martedì": 1, "martedi": 1, "mar": 1,
     "mercoledì": 2, "mercoledi": 2, "mer": 2,
     "giovedì": 3, "giovedi": 3, "gio": 3,
@@ -88,413 +65,526 @@ WEEKDAY_MAP = {
     "domenica": 6, "dom": 6,
 }
 
-def next_weekday(start_date: date, weekday: int) -> date:
-    days_ahead = (weekday - start_date.weekday()) % 7
-    if days_ahead == 0:
-        # se oggi è lo stesso giorno, consideriamo "oggi" come valido
-        return start_date
-    return start_date + timedelta(days=days_ahead)
+app = Flask(__name__)
 
-def parse_time_any(text: str):
-    """
-    Ritorna time(HH,MM) se trova:
-    - 17:30
-    - 17.30
-    - alle 18
-    - 18
-    """
-    t = text.lower().strip()
+# =========================
+# GOOGLE CALENDAR AUTH
+# =========================
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID") or "primary"
 
-    # 17:30 o 17.30
+def build_calendar_service():
+    """
+    Supporta 2 modalità:
+    A) GOOGLE_SERVICE_ACCOUNT_JSON (consigliata su Railway)
+    B) credentials.json nel repo
+    """
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    scopes = ["https://www.googleapis.com/auth/calendar"]
+
+    if sa_json:
+        info = json.loads(sa_json)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    else:
+        # fallback file (solo se esiste davvero nel repo)
+        creds = service_account.Credentials.from_service_account_file("credentials.json", scopes=scopes)
+
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+def get_calendar():
+    return build_calendar_service()
+
+# =========================
+# MEMORIA BREVE (sessione)
+# =========================
+SESSIONS: Dict[str, dict] = {}
+
+# =========================
+# UTILS
+# =========================
+def now_local() -> dt.datetime:
+    if TZ:
+        return dt.datetime.now(TZ)
+    return dt.datetime.now()
+
+def parse_time(text: str) -> Optional[dt.time]:
+    """
+    Accetta: 17:30, 17.30, 1730, 17
+    """
+    t = text.strip().lower()
     m = re.search(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b", t)
     if m:
-        return time(int(m.group(1)), int(m.group(2)))
-
-    # "alle 18" / "dopo le 18" / "ore 18"
-    m = re.search(r"\b(?:alle|dopo\s+le|ore)\s*([01]?\d|2[0-3])\b", t)
-    if m:
-        return time(int(m.group(1)), 0)
-
-    # solo "18"
-    m = re.search(r"\b([01]?\d|2[0-3])\b", t)
-    if m and ("domani" in t or "oggi" in t or "merco" in t or "mart" in t or "giov" in t or "vener" in t or "sab" in t):
-        return time(int(m.group(1)), 0)
-
+        return dt.time(int(m.group(1)), int(m.group(2)))
+    m2 = re.search(r"\b([01]?\d|2[0-3])\b", t)
+    if m2:
+        return dt.time(int(m2.group(1)), 0)
+    m3 = re.search(r"\b([01]\d|2[0-3])([0-5]\d)\b", t)
+    if m3:
+        return dt.time(int(m3.group(1)), int(m3.group(2)))
     return None
 
-def parse_date_any(text: str) -> date | None:
-    t = text.lower().strip()
-    today = datetime.now(TZ).date()
+def parse_date(text: str) -> Optional[dt.date]:
+    """
+    Accetta: 17/12, 17-12, 17/12/2025
+    """
+    t = text.strip().lower()
+    m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", t)
+    if not m:
+        return None
+    day = int(m.group(1))
+    month = int(m.group(2))
+    year_raw = m.group(3)
+    if year_raw:
+        y = int(year_raw)
+        year = 2000 + y if y < 100 else y
+    else:
+        year = now_local().year
+    try:
+        return dt.date(year, month, day)
+    except ValueError:
+        return None
 
+def next_weekday(target_wd: int) -> dt.date:
+    today = now_local().date()
+    days_ahead = (target_wd - today.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return today + dt.timedelta(days=days_ahead)
+
+def parse_relative_day(text: str) -> Optional[dt.date]:
+    t = text.lower()
+    today = now_local().date()
     if "oggi" in t:
         return today
     if "domani" in t:
-        return today + timedelta(days=1)
+        return today + dt.timedelta(days=1)
+    if "dopodomani" in t:
+        return today + dt.timedelta(days=2)
 
-    # formato 17/12 o 17/12/2025
-    m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", t)
-    if m:
-        d = int(m.group(1))
-        mo = int(m.group(2))
-        y = m.group(3)
-        if y:
-            yy = int(y)
-            if yy < 100:
-                yy += 2000
-        else:
-            yy = today.year
-        try:
-            return date(yy, mo, d)
-        except ValueError:
-            return None
-
-    # giorno settimana
-    for k, wd in WEEKDAY_MAP.items():
-        if k in t:
-            return next_weekday(today, wd)
-
+    # giorno della settimana
+    for k, wd in WEEKDAYS_IT.items():
+        if re.search(r"\b" + re.escape(k) + r"\b", t):
+            return next_weekday(wd)
     return None
 
-def parse_after_constraint(text: str):
+def time_window_from_text(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
     """
-    Gestisce:
-    - "dopo le 17:30"
-    - "sera" -> dopo 17:30
+    Estrae vincoli tipo:
+    - "dopo le 18"
+    - "prima delle 12"
+    - "sera", "mattina", "pomeriggio"
     """
     t = text.lower()
-    after_t = None
 
-    if "dopo" in t:
-        tt = parse_time_any(t)
-        if tt:
-            after_t = tt
+    after = None
+    before = None
 
+    m_after = re.search(r"\bdopo\s+le?\s+([0-2]?\d(?:[:\.][0-5]\d)?)\b", t)
+    if m_after:
+        after = parse_time(m_after.group(1))
+
+    m_before = re.search(r"\bprima\s+delle?\s+([0-2]?\d(?:[:\.][0-5]\d)?)\b", t)
+    if m_before:
+        before = parse_time(m_before.group(1))
+
+    # fasce generiche
+    if "mattina" in t:
+        after = after or dt.time(9, 0)
+        before = before or dt.time(12, 0)
+    if "pomeriggio" in t:
+        after = after or dt.time(14, 0)
+        before = before or dt.time(19, 0)
     if "sera" in t:
-        # default “sera” = dopo 17:30
-        if after_t is None:
-            after_t = time(17, 30)
+        after = after or dt.time(17, 30)
+        before = before or dt.time(22, 0)
 
-    return after_t
+    return after, before
 
-
-# =========================
-# CALENDARIO: FREE/BUSY + CREAZIONE EVENTI
-# =========================
-def day_open_ranges(d: date):
-    return OPEN_HOURS.get(d.weekday(), [])
-
-def is_within_open_hours(start_dt: datetime, end_dt: datetime) -> bool:
-    ranges = day_open_ranges(start_dt.date())
-    for s, e in ranges:
-        sdt = datetime.combine(start_dt.date(), s, tzinfo=TZ)
-        edt = datetime.combine(start_dt.date(), e, tzinfo=TZ)
-        if start_dt >= sdt and end_dt <= edt:
+def within_business_hours(date_: dt.date, t: dt.time) -> bool:
+    intervals = BUSINESS_HOURS.get(date_.weekday(), [])
+    for start_s, end_s in intervals:
+        hs, ms = map(int, start_s.split(":"))
+        he, me = map(int, end_s.split(":"))
+        start = dt.time(hs, ms)
+        end = dt.time(he, me)
+        # slot deve finire entro orario di chiusura
+        slot_end_dt = dt.datetime.combine(date_, t) + dt.timedelta(minutes=SLOT_MINUTES)
+        slot_end = slot_end_dt.time()
+        if start <= t and slot_end <= end:
             return True
     return False
 
-def is_free(start_dt: datetime, end_dt: datetime) -> bool:
-    if not calendar or not CALENDAR_ID:
-        return False
+def round_to_next_slot(d: dt.datetime) -> dt.datetime:
+    minutes = (d.minute // SLOT_MINUTES) * SLOT_MINUTES
+    base = d.replace(minute=minutes, second=0, microsecond=0)
+    if base < d:
+        base += dt.timedelta(minutes=SLOT_MINUTES)
+    return base
 
+def format_dt(d: dt.datetime) -> str:
+    return d.strftime("%a %d/%m %H:%M").replace("Mon", "Lun").replace("Tue", "Mar").replace("Wed", "Mer").replace("Thu", "Gio").replace("Fri", "Ven").replace("Sat", "Sab").replace("Sun", "Dom")
+
+def parse_choice_number(text: str) -> Optional[int]:
+    m = re.search(r"\b(\d{1,2})\b", text.strip())
+    if not m:
+        return None
+    return int(m.group(1))
+
+# =========================
+# GOOGLE CALENDAR HELPERS
+# =========================
+def is_free(calendar, start: dt.datetime, end: dt.datetime) -> bool:
     body = {
-        "timeMin": start_dt.isoformat(),
-        "timeMax": end_dt.isoformat(),
-        "timeZone": "Europe/Rome",
-        "items": [{"id": CALENDAR_ID}],
+        "timeMin": start.isoformat(),
+        "timeMax": end.isoformat(),
+        "items": [{"id": GOOGLE_CALENDAR_ID}],
     }
     fb = calendar.freebusy().query(body=body).execute()
-    busy = fb["calendars"][CALENDAR_ID]["busy"]
+    busy = fb["calendars"][GOOGLE_CALENDAR_ID].get("busy", [])
     return len(busy) == 0
 
-def create_event(start_dt: datetime, end_dt: datetime, phone: str):
-    if not calendar or not CALENDAR_ID:
-        raise RuntimeError("Calendar non configurato")
-
+def create_event(calendar, start: dt.datetime, end: dt.datetime, phone: str) -> str:
     event = {
-        "summary": "💈 Taglio uomo",
-        "description": f"Prenotazione WhatsApp - {phone}",
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": "Europe/Rome"},
-        "end": {"dateTime": end_dt.isoformat(), "timeZone": "Europe/Rome"},
+        "summary": SERVICE_NAME,
+        "start": {"dateTime": start.isoformat(), "timeZone": APP_TZ},
+        "end": {"dateTime": end.isoformat(), "timeZone": APP_TZ},
+        "description": f"Prenotazione WhatsApp\nTelefono: {phone}",
+        "extendedProperties": {"private": {"phone": phone, "service": "taglio_uomo"}},
     }
-    return calendar.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+    created = calendar.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+    return created.get("id", "")
 
-
-def iter_candidate_slots(d: date, after_t: time | None = None):
-    ranges = day_open_ranges(d)
-    for (s, e) in ranges:
-        cur = datetime.combine(d, s, tzinfo=TZ)
-        end = datetime.combine(d, e, tzinfo=TZ)
-
-        if after_t:
-            after_dt = datetime.combine(d, after_t, tzinfo=TZ)
-            if cur < after_dt:
-                cur = after_dt
-
-        # arrotonda al prossimo slot da 30 min
-        minute = (cur.minute // SLOT_MINUTES) * SLOT_MINUTES
-        cur = cur.replace(minute=minute, second=0, microsecond=0)
-        if cur.minute % SLOT_MINUTES != 0:
-            cur += timedelta(minutes=SLOT_MINUTES - (cur.minute % SLOT_MINUTES))
-
-        while cur + timedelta(minutes=SLOT_MINUTES) <= end:
-            yield cur
-            cur += timedelta(minutes=SLOT_MINUTES)
-
-
-def find_free_slots(preferred_date: date | None,
-                    exact_time: time | None,
-                    after_time: time | None,
-                    max_days: int = 7,
-                    limit: int = 5):
+def get_customer_history(calendar, phone: str) -> Tuple[int, Optional[dt.datetime]]:
     """
-    Ritorna slot liberi (datetime start) rispettando:
-    - giorno specifico (preferred_date) se fornito
-    - orario esatto (exact_time) se fornito: cerca quello, altrimenti alternative
-    - vincolo "dopo le X" (after_time)
+    Memoria lunga "gratis" dal calendario:
+    - conta appuntamenti
+    - ultimo appuntamento
     """
-    today = datetime.now(TZ).date()
-    base = preferred_date or today
+    try:
+        events = calendar.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            maxResults=50,
+            singleEvents=True,
+            orderBy="startTime",
+            privateExtendedProperty=f"phone={phone}",
+            timeMin=(now_local() - dt.timedelta(days=3650)).isoformat(),
+        ).execute()
+        items = events.get("items", [])
+        count = len(items)
+        last_dt = None
+        if items:
+            last = items[-1]
+            s = last["start"].get("dateTime")
+            if s:
+                last_dt = dt.datetime.fromisoformat(s)
+        return count, last_dt
+    except Exception:
+        return 0, None
 
-    # se la data è nel passato, riparti da oggi
-    if base < today:
-        base = today
+def find_slots(calendar, preferred_date: Optional[dt.date], after: Optional[dt.time], before: Optional[dt.time], limit: int = 5, max_days: int = 10) -> List[dt.datetime]:
+    """
+    Cerca slot liberi rispettando:
+    - orari negozio
+    - vincoli after/before
+    - calendario occupato
+    """
+    slots: List[dt.datetime] = []
+    today = now_local().date()
+    start_date = preferred_date or today
 
-    results = []
-
-    # Se l'utente chiede un orario preciso, proviamo prima quel giorno e quell’ora
-    if preferred_date and exact_time:
-        start_dt = datetime.combine(preferred_date, exact_time, tzinfo=TZ)
-        end_dt = start_dt + timedelta(minutes=SLOT_MINUTES)
-        if is_within_open_hours(start_dt, end_dt) and is_free(start_dt, end_dt):
-            return [start_dt]
-
-        # se non disponibile, proponi alternative nello stesso giorno:
-        for cand in iter_candidate_slots(preferred_date, after_time or exact_time):
-            end_c = cand + timedelta(minutes=SLOT_MINUTES)
-            if is_within_open_hours(cand, end_c) and is_free(cand, end_c):
-                results.append(cand)
-                if len(results) >= limit:
-                    return results
-
-        # oppure stesso orario nei prossimi giorni
-        for i in range(1, max_days + 1):
-            d = preferred_date + timedelta(days=i)
-            start_dt = datetime.combine(d, exact_time, tzinfo=TZ)
-            end_dt = start_dt + timedelta(minutes=SLOT_MINUTES)
-            if is_within_open_hours(start_dt, end_dt) and is_free(start_dt, end_dt):
-                results.append(start_dt)
-                if len(results) >= limit:
-                    return results
-
-        return results
-
-    # Caso generale: cerca slot liberi a partire dalla data
-    for i in range(0, max_days + 1):
-        d = base + timedelta(days=i)
-        # salta giorni chiusi
-        if not day_open_ranges(d):
+    for day_offset in range(0, max_days + 1):
+        d = start_date + dt.timedelta(days=day_offset)
+        # se negozio chiuso, skip
+        if not BUSINESS_HOURS.get(d.weekday(), []):
             continue
 
-        for cand in iter_candidate_slots(d, after_time):
-            end_c = cand + timedelta(minutes=SLOT_MINUTES)
-            if is_free(cand, end_c):
-                results.append(cand)
-                if len(results) >= limit:
-                    return results
+        # finestre del giorno
+        intervals = BUSINESS_HOURS[d.weekday()]
+        for start_s, end_s in intervals:
+            hs, ms = map(int, start_s.split(":"))
+            he, me = map(int, end_s.split(":"))
+            start_dt = dt.datetime.combine(d, dt.time(hs, ms))
+            end_dt = dt.datetime.combine(d, dt.time(he, me))
 
-    return results
+            # applica vincoli after/before
+            if after:
+                start_dt = max(start_dt, dt.datetime.combine(d, after))
+            if before:
+                end_dt = min(end_dt, dt.datetime.combine(d, before))
 
+            # se finestra troppo piccola
+            if end_dt <= start_dt:
+                continue
 
-def fmt_slot(dt: datetime) -> str:
-    # "Mar 16/12 09:30"
-    giorni = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
-    return f"{giorni[dt.weekday()]} {dt.strftime('%d/%m')} {dt.strftime('%H:%M')}"
+            # se oggi: non proporre passato
+            if d == today:
+                start_dt = max(start_dt, round_to_next_slot(now_local()))
+
+            cur = round_to_next_slot(start_dt)
+
+            while cur + dt.timedelta(minutes=SLOT_MINUTES) <= end_dt:
+                cur_end = cur + dt.timedelta(minutes=SLOT_MINUTES)
+                # check business
+                if within_business_hours(d, cur.time()):
+                    try:
+                        if is_free(calendar, cur, cur_end):
+                            slots.append(cur)
+                            if len(slots) >= limit:
+                                return slots
+                    except HttpError:
+                        # se API non va, interrompi
+                        return slots
+                cur += dt.timedelta(minutes=SLOT_MINUTES)
+
+    return slots
+
+# =========================
+# CONVERSATION LOGIC
+# =========================
+def help_text() -> str:
+    return (
+        "Ciao! Io gestisco solo le prenotazioni per taglio uomo 💈\n"
+        "Scrivimi ad esempio:\n"
+        "- “Hai posto domani?”\n"
+        "- “Vorrei prenotare il 17/12 alle 18:00”\n"
+        "- “Mercoledì dopo le 18”"
+    )
+
+def set_session(phone: str, **kwargs):
+    s = SESSIONS.get(phone, {})
+    s.update(kwargs)
+    # “memoria breve” anti-reset: conserva solo cose utili
+    SESSIONS[phone] = s
+
+def reset_flow(phone: str):
+    keep = {}
+    # puoi mantenere preferenze future se vuoi; qui resetto tutto
+    SESSIONS[phone] = keep
+
+def handle_message(phone: str, text: str) -> str:
+    t = text.strip()
+    tlow = t.lower()
+
+    # cancella
+    if any(w in tlow for w in CANCEL_WORDS):
+        reset_flow(phone)
+        return "Va bene 👍 Prenotazione annullata. Se vuoi riprovare, dimmi giorno e ora (es. “Mercoledì 18:00”)."
+
+    # sessione
+    s = SESSIONS.get(phone, {})
+    state = s.get("state")
+
+    # prova a costruire riferimenti data/ora dal messaggio
+    abs_date = parse_date(t)
+    rel_date = parse_relative_day(t)
+    date_ = abs_date or rel_date
+
+    time_ = parse_time(t)
+    after, before = time_window_from_text(t)
+
+    wants_booking = any(k in tlow for k in BOOKING_HINTS) or bool(date_) or bool(time_) or ("dopo" in tlow) or ("prima" in tlow)
+
+    # stato: in attesa di conferma finale
+    if state == "confirm":
+        if tlow.strip() in CONFIRM_WORDS or any(w == tlow.strip() for w in CONFIRM_WORDS):
+            chosen_iso = s.get("chosen_iso")
+            if not chosen_iso:
+                reset_flow(phone)
+                return "Ops, ho perso lo slot. Riproviamo: che giorno e a che ora preferisci?"
+            start = dt.datetime.fromisoformat(chosen_iso)
+            end = start + dt.timedelta(minutes=SLOT_MINUTES)
+
+            try:
+                calendar = get_calendar()
+                # ricontrollo libero (race condition)
+                if not is_free(calendar, start, end):
+                    reset_flow(phone)
+                    return "Quello slot è appena stato occupato 😅 Vuoi che ti proponga altri orari?"
+
+                create_event(calendar, start, end, phone)
+                reset_flow(phone)
+                return (
+                    f"✅ Appuntamento confermato!\n"
+                    f"💈 {SERVICE_NAME}\n"
+                    f"🕒 {format_dt(start)}\n\n"
+                    f"A presto 👋"
+                )
+            except Exception as e:
+                reset_flow(phone)
+                return f"Ho un problema tecnico nel salvare in agenda ({type(e).__name__}). Riprova tra poco."
+
+        # se invece risponde con altra richiesta tipo “sera dopo le 18”
+        # allora interpreto come modifica preferenza e continuo
+        state = None
+        s["state"] = None
+        SESSIONS[phone] = s
+
+    # stato: lista slot mostrata (scegli 1..N) — qui ACCETTO anche orari/nuove preferenze
+    if state == "choose":
+        options: List[str] = s.get("options", [])  # ISO strings
+        n = parse_choice_number(t)
+        if n and 1 <= n <= len(options):
+            chosen = dt.datetime.fromisoformat(options[n - 1])
+            set_session(phone, state="confirm", chosen_iso=options[n - 1])
+            return (
+                "Confermi questo appuntamento?\n"
+                f"💈 {SERVICE_NAME}\n"
+                f"🕒 {format_dt(chosen)}\n\n"
+                "Rispondi OK per confermare oppure “annulla”."
+            )
+
+        # se non è un numero valido, provo a capire se sta chiedendo “sera”, “mercoledì dopo le 18”, “17:30”, ecc.
+        if wants_booking:
+            # proseguo sotto generando nuovi slot coerenti
+            pass
+        else:
+            return "Dimmi un numero della lista oppure scrivi una preferenza tipo “mercoledì dopo le 18” 🙂"
+
+    # se non capisco e non è booking
+    if not wants_booking:
+        # saluto o help
+        if tlow in {"ciao", "salve", "buongiorno", "buonasera", "hey"}:
+            try:
+                calendar = get_calendar()
+                count, last_dt = get_customer_history(calendar, phone)
+                if count > 0 and last_dt:
+                    return (
+                        f"Ciao! Bentornato 😊\n"
+                        f"Vedo che hai già prenotato da noi {count} volta/e. Ultima: {format_dt(last_dt)}.\n\n"
+                        f"Quando vuoi venire per il prossimo {SERVICE_NAME}?"
+                    )
+            except Exception:
+                pass
+            return help_text()
+
+        return help_text()
+
+    # =========================
+    # BOOKING FLOW (stateless + session)
+    # =========================
+
+    # se l’utente scrive solo una data (es: “il 17/12”) chiedi l’orario o fascia
+    if date_ and not time_ and not after and not before:
+        set_session(phone, state="need_time", preferred_date=date_.isoformat())
+        return "Perfetto 👍 A che ora preferisci? (es. 17:30) oppure dimmi una fascia (es. “dopo le 18”)."
+
+    # se l’utente scrive solo orario (es: “alle 18”) senza data: chiedi giorno
+    if (time_ or after or before) and not date_:
+        set_session(phone, state="need_date", after=(after.isoformat() if after else None), before=(before.isoformat() if before else None), preferred_time=(time_.isoformat() if time_ else None))
+        return "Ok 👍 Per che giorno? (es. “domani”, “mercoledì”, “17/12”)."
+
+    # se ho data e un orario preciso: provo quello slot, altrimenti alternative
+    preferred_date = date_
+    preferred_time = time_
+    if preferred_date and preferred_time:
+        if not within_business_hours(preferred_date, preferred_time):
+            # proponi alternative stesso giorno vicino (se possibile) oppure stesso orario in altro giorno
+            try:
+                calendar = get_calendar()
+                slots = find_slots(calendar, preferred_date, None, None, limit=5, max_days=7)
+                if not slots:
+                    return "Non trovo disponibilità nei prossimi giorni. Vuoi indicarmi un’altra fascia oraria?"
+                set_session(phone, state="choose", options=[s.isoformat() for s in slots])
+                lines = ["Ecco i prossimi orari liberi:"]
+                for i, sl in enumerate(slots, start=1):
+                    lines.append(f"{i}) {sl.strftime('%d/%m %H:%M')}")
+                lines.append("\nRispondi con il numero oppure scrivi una preferenza (es. “mercoledì dopo le 18”).")
+                return "\n".join(lines)
+            except Exception:
+                return "Ho un problema tecnico nel controllare l’agenda. Riprova tra poco."
+        try:
+            calendar = get_calendar()
+            start = dt.datetime.combine(preferred_date, preferred_time)
+            if TZ:
+                start = start.replace(tzinfo=TZ)
+            end = start + dt.timedelta(minutes=SLOT_MINUTES)
+
+            if is_free(calendar, start, end):
+                set_session(phone, state="confirm", chosen_iso=start.isoformat())
+                return (
+                    "Perfetto 👍 Confermi questo appuntamento?\n"
+                    f"💈 {SERVICE_NAME}\n"
+                    f"🕒 {format_dt(start)}\n\n"
+                    "Rispondi OK per confermare oppure “annulla”."
+                )
+
+            # non libero: cerca alternative stesso giorno vicino all’orario, altrimenti giorni successivi stessa fascia
+            slots = find_slots(calendar, preferred_date, None, None, limit=5, max_days=7)
+            if not slots:
+                return "A quell’ora non ho disponibilità e non trovo alternative nei prossimi giorni. Vuoi un altro orario?"
+            set_session(phone, state="choose", options=[s.isoformat() for s in slots])
+            lines = ["A quell’ora non ho posto. Ecco i prossimi orari liberi:"]
+            for i, sl in enumerate(slots, start=1):
+                lines.append(f"{i}) {sl.strftime('%d/%m %H:%M')}")
+            lines.append("\nRispondi con il numero oppure scrivi un orario/preferenza (es. “domani sera dopo le 18”).")
+            return "\n".join(lines)
+
+        except HttpError as e:
+            # Mostra messaggio chiaro
+            return f"Errore Google Calendar ({e.resp.status}). Controlla che Calendar API sia attiva e che il calendario sia condiviso col service account."
+        except Exception as e:
+            return f"Problema tecnico nel controllare l’agenda ({type(e).__name__}). Riprova tra poco."
+
+    # se ho data + vincolo fascia (dopo/prima) senza orario esatto: proponi slot coerenti
+    if preferred_date and (after or before) and not preferred_time:
+        try:
+            calendar = get_calendar()
+            slots = find_slots(calendar, preferred_date, after, before, limit=5, max_days=7)
+            if not slots:
+                return "Non vedo disponibilità in quella fascia. Vuoi un altro orario o un altro giorno?"
+            set_session(phone, state="choose", options=[s.isoformat() for s in slots])
+            lines = ["Perfetto 👍 Ecco alcune disponibilità:"]
+            for i, sl in enumerate(slots, start=1):
+                lines.append(f"{i}) {sl.strftime('%d/%m %H:%M')}")
+            lines.append("\nRispondi con il numero oppure scrivi un altro orario (es. 19:00).")
+            return "\n".join(lines)
+        except Exception:
+            return "Ho un problema tecnico nel controllare l’agenda. Riprova tra poco."
+
+    # se l’utente chiede “hai posto domani?” ecc: proponi subito slot
+    if any(k in tlow for k in AVAILABILITY_HINTS) or "hai posto" in tlow:
+        preferred_date = preferred_date or (now_local().date() + dt.timedelta(days=1) if "domani" in tlow else None)
+        try:
+            calendar = get_calendar()
+            slots = find_slots(calendar, preferred_date, after, before, limit=5, max_days=10)
+            if not slots:
+                return "Non vedo disponibilità a breve. Vuoi indicarmi un giorno preciso o una fascia (es. “mercoledì dopo le 18”)?"
+            set_session(phone, state="choose", options=[s.isoformat() for s in slots])
+            lines = ["Ecco i prossimi orari liberi:"]
+            for i, sl in enumerate(slots, start=1):
+                lines.append(f"{i}) {sl.strftime('%d/%m %H:%M')}")
+            lines.append("\nRispondi con il numero oppure scrivi una preferenza (es. “mercoledì dopo le 18”).")
+            return "\n".join(lines)
+        except Exception:
+            return "Ho un problema tecnico nel controllare l’agenda. Riprova tra poco."
+
+    # fallback: se booking ma non ho abbastanza info
+    return "Ok 👍 Dimmi per che giorno e che ora preferisci (es. “mercoledì 18:00” oppure “domani sera dopo le 17:30”)."
 
 
 # =========================
-# RISPOSTE
-# =========================
-def reply_text_for_slots(slots):
-    if not slots:
-        return ("Al momento non trovo disponibilità nelle fasce richieste 😕\n"
-                "Vuoi provare con un altro giorno o un altro orario?")
-
-    lines = ["Perfetto 💈 Ecco i prossimi orari liberi (30 minuti):"]
-    for i, s in enumerate(slots, start=1):
-        lines.append(f"{i}) {fmt_slot(s)}")
-    lines.append("\nRispondi con 1, 2, 3... oppure scrivimi giorno e/o orario (es. “mercoledì dopo le 18” o “17:30”).")
-    return "\n".join(lines)
-
-
-def wants_booking(text: str) -> bool:
-    t = text.lower()
-    keys = ["prenot", "appunt", "posto", "disponib", "taglio", "domani", "mart", "merc", "giov", "vener", "sab", "/"]
-    return any(k in t for k in keys)
-
-
-# =========================
-# WEBHOOK WHATSAPP
+# ROUTES
 # =========================
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
-    phone = request.form.get("From", "")
-    msg = (request.form.get("Body", "") or "").strip()
+    phone = request.form.get("From", "").strip()  # es: whatsapp:+39...
+    body = request.form.get("Body", "").strip()
+
+    if not body:
+        body = "ciao"
+
+    try:
+        reply = handle_message(phone, body)
+    except Exception as e:
+        reply = f"Ho avuto un problema tecnico ({type(e).__name__}). Riprova tra poco."
 
     resp = MessagingResponse()
-
-    # sanity
-    if not msg:
-        resp.message("Ciao! Vuoi prenotare un taglio uomo? Scrivimi giorno e orario 😊")
-        return str(resp)
-
-    # init session
-    s = SESSIONS.get(phone, {
-        "state": "idle",              # idle | choosing | confirming
-        "last_slots": [],
-        "pending_slot": None
-    })
-
-    low = msg.lower().strip()
-
-    # 1) conferma
-    if s["state"] == "confirming":
-        if low in CONFIRM_WORDS:
-            slot = s.get("pending_slot")
-            if not slot:
-                s["state"] = "idle"
-                SESSIONS[phone] = s
-                resp.message("Ok! Dimmi che giorno/orario preferisci 😊")
-                return str(resp)
-
-            try:
-                start_dt = datetime.fromisoformat(slot).astimezone(TZ)
-                end_dt = start_dt + timedelta(minutes=SLOT_MINUTES)
-                create_event(start_dt, end_dt, phone)
-
-                resp.message(
-                    "✅ Appuntamento confermato!\n"
-                    f"💈 Taglio uomo\n🕒 {fmt_slot(start_dt)}\n\nA presto 👋"
-                )
-            except HttpError:
-                resp.message("Ho avuto un problema a salvare in calendario 😕 Riprova tra poco.")
-            except Exception:
-                resp.message("Problema tecnico. Riprova tra poco.")
-            finally:
-                s["state"] = "idle"
-                s["last_slots"] = []
-                s["pending_slot"] = None
-                SESSIONS[phone] = s
-            return str(resp)
-
-        if low in CANCEL_WORDS:
-            s["state"] = "idle"
-            s["pending_slot"] = None
-            SESSIONS[phone] = s
-            resp.message("Va bene, annullato. Dimmi un altro giorno/orario 😊")
-            return str(resp)
-
-        # se in conferma l’utente cambia idea con un nuovo vincolo (es. “mercoledì dopo le 18”)
-        s["state"] = "idle"
-        s["pending_slot"] = None
-        # continua nel flusso sotto (ricerca nuovi slot)
-
-    # 2) scelta numerica
-    if s["state"] == "choosing":
-        if re.fullmatch(r"\d+", low):
-            idx = int(low) - 1
-            if 0 <= idx < len(s["last_slots"]):
-                chosen = s["last_slots"][idx]
-                s["pending_slot"] = chosen.isoformat()
-                s["state"] = "confirming"
-                SESSIONS[phone] = s
-                resp.message(
-                    "Confermi questo appuntamento?\n"
-                    f"💈 Taglio uomo\n🕒 {fmt_slot(chosen)}\n\n"
-                    "Rispondi OK per confermare oppure annulla."
-                )
-                return str(resp)
-            # numero non valido → non bloccare, chiedi chiarimento
-            # (continua sotto)
-        # se non è numero, lo trattiamo come nuova richiesta (orario/giorno)
-
-    # 3) intent: prenotazione
-    if not wants_booking(low):
-        resp.message(
-            "Ciao! Io gestisco solo le prenotazioni per taglio uomo 💈\n"
-            "Scrivimi ad esempio:\n"
-            "- “Hai posto domani dopo le 17:30?”\n"
-            "- “Mercoledì dopo le 18”\n"
-            "- “Il 17/12 alle 10:00”"
-        )
-        s["state"] = "idle"
-        s["last_slots"] = []
-        s["pending_slot"] = None
-        SESSIONS[phone] = s
-        return str(resp)
-
-    # 4) estrai vincoli
-    preferred_date = parse_date_any(low)
-    exact_time = None
-    after_time = parse_after_constraint(low)
-
-    # se l'utente scrive un orario secco (17:30), lo usiamo come "orario preferito"
-    tmsg = parse_time_any(low)
-    if tmsg:
-        exact_time = tmsg
-        # se non c’è “dopo”, consideriamo l’orario come after_time per proporre slot da lì in poi
-        if after_time is None and ("dopo" not in low):
-            after_time = tmsg
-
-    # 5) cerca slot
-    if not CALENDAR_ID or not calendar:
-        resp.message("Calendar non configurato. Controlla GOOGLE_CALENDAR_ID e GOOGLE_SERVICE_ACCOUNT_JSON su Railway.")
-        return str(resp)
-
-    slots = find_free_slots(
-        preferred_date=preferred_date,
-        exact_time=exact_time if preferred_date else None,  # solo se c’è anche la data
-        after_time=after_time,
-        max_days=7,
-        limit=5
-    )
-
-    if slots:
-        s["state"] = "choosing"
-        s["last_slots"] = slots
-        s["pending_slot"] = None
-        SESSIONS[phone] = s
-        resp.message(reply_text_for_slots(slots))
-        return str(resp)
-
-    # se nessun risultato, prova fallback: stesso orario nei prossimi giorni (se l’utente ha dato un orario)
-    if exact_time and not preferred_date:
-        slots2 = find_free_slots(
-            preferred_date=datetime.now(TZ).date(),
-            exact_time=None,
-            after_time=exact_time,
-            max_days=14,
-            limit=5
-        )
-        s["state"] = "choosing"
-        s["last_slots"] = slots2
-        s["pending_slot"] = None
-        SESSIONS[phone] = s
-        resp.message(reply_text_for_slots(slots2))
-        return str(resp)
-
-    s["state"] = "idle"
-    s["last_slots"] = []
-    s["pending_slot"] = None
-    SESSIONS[phone] = s
-    resp.message("Non trovo disponibilità con quei vincoli 😕 Vuoi un altro giorno/orario?")
+    resp.message(reply)
     return str(resp)
-
 
 @app.route("/")
 def home():
     return "Chatbot parrucchiere attivo ✅"
 
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
