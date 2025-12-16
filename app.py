@@ -607,6 +607,19 @@ def _try_specific_slot_or_alternatives(phone: str, calendar, date_: dt.date, tim
 def home():
     return "Chatbot parrucchiere attivo ✅"
 
+@app.route("/test", methods=["GET"])
+def test():
+    phone = request.args.get("phone", "+393000000000")
+    msg = request.args.get("msg", "ciao")
+
+    reply = handle_message(phone, msg)
+
+    return {
+        "phone": phone,
+        "message_in": msg,
+        "bot_reply": reply
+    }
+
 # ✅ TEST SENZA TWILIO (browser)
 # Esempio:
 # /test?phone=+39333&msg=hai%20posto%20domani%20sera%20dopo%20le%2018
