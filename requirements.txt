@@ -1,8 +1,7 @@
 flask
 gunicorn
-twilio
+psycopg2-binary
 google-api-python-client
 google-auth
 google-auth-oauthlib
-google-auth-httplib2
-pytz
+python-dateutil
