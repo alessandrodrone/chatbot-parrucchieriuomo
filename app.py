@@ -1,140 +1,160 @@
-from __future__ import annotations
-
-import os
-import json
-import re
-import datetime as dt
 from flask import Flask, request, jsonify
-
+import os, json, re
+from datetime import datetime, timedelta, time
+from dateutil import tz, parser
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ======================
-# APP
-# ======================
 app = Flask(__name__)
 
-# ======================
-# ENV
-# ======================
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+# ================= CONFIG =================
+TZ_DEFAULT = "Europe/Rome"
+SLOT_FALLBACK = 30
+
+GOOGLE_SERVICE_ACCOUNT_JSON = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
-    raise RuntimeError("Variabili GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_SHEET_ID mancanti")
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/spreadsheets.readonly"
+]
 
-# ======================
-# GOOGLE SHEETS
-# ======================
-def sheets_service():
-    creds = service_account.Credentials.from_service_account_info(
-        json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+# ================= GOOGLE =================
+creds = service_account.Credentials.from_service_account_info(
+    GOOGLE_SERVICE_ACCOUNT_JSON,
+    scopes=SCOPES
+)
+sheets = build("sheets", "v4", credentials=creds)
+calendar = build("calendar", "v3", credentials=creds)
 
-def load_sheet(tab_name: str) -> list[dict]:
-    service = sheets_service()
-    result = service.spreadsheets().values().get(
+# ================= UTIL =================
+def normalize_phone(p):
+    return re.sub(r"\D", "", p or "")
+
+def load_sheet(name):
+    res = sheets.spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range=tab_name
+        range=name
     ).execute()
-
-    values = result.get("values", [])
-    if not values:
+    rows = res.get("values", [])
+    if not rows:
         return []
+    keys = rows[0]
+    return [dict(zip(keys, r)) for r in rows[1:]]
 
-    headers = [h.strip() for h in values[0]]
-    rows = []
-
-    for row in values[1:]:
-        item = {}
-        for i, h in enumerate(headers):
-            item[h] = row[i].strip() if i < len(row) else ""
-        rows.append(item)
-
-    return rows
-
-# ======================
-# UTILS
-# ======================
-def normalize_phone(p: str) -> str:
-    """
-    Rimuove tutto tranne numeri.
-    +39 348 111111 → 393481111111
-    whatsapp:+39348... → 39348...
-    """
-    if not p:
-        return ""
-    return re.sub(r"\D", "", p)
-
-# ======================
-# SHOP LOOKUP
-# ======================
-def load_shop(phone: str):
-    phone_n = normalize_phone(phone)
-
-    shops = load_sheet("shops")
-
-    print("DEBUG phone ricevuto:", phone)
-    print("DEBUG phone normalizzato:", phone_n)
-    print("DEBUG shops:", shops)
-
-    for s in shops:
-        sheet_phone = normalize_phone(s.get("whatsapp_number", ""))
-        print("CONFRONTO:", phone_n, "VS", sheet_phone)
-
-        if phone_n == sheet_phone:
+def find_shop(phone):
+    phone = normalize_phone(phone)
+    for s in load_sheet("shops"):
+        if normalize_phone(s["whatsapp_number"]) == phone:
             return s
-
     return None
 
-# ======================
-# LOGICA CHAT (MINIMA)
-# ======================
-def handle_message(shop: dict, phone: str, msg: str) -> str:
-    msg_l = msg.lower()
+def get_services(shop_id):
+    return [s for s in load_sheet("services") if s["shop_id"] == shop_id]
 
-    if msg_l in {"ciao", "salve", "buongiorno", "buonasera"}:
-        return (
-            f"Ciao! 👋\n"
-            f"Sei in contatto con *{shop['name']}* 💈\n\n"
-            f"Dimmi quando vuoi prenotare 😊"
-        )
+def get_session(shop_id, phone):
+    for s in load_sheet("sessions"):
+        if s["shop_id"] == shop_id and s["phone"] == phone:
+            return s
+    return None
 
-    return "Perfetto 👍 Dimmi giorno e ora (es. domani alle 18)."
+def save_session(shop_id, phone, state, data):
+    # simulazione: in prod diventa DB
+    pass
 
-# ======================
-# ROUTES
-# ======================
-@app.route("/")
-def home():
-    return "Chatbot Parrucchieri attivo ✅"
+def parse_natural_date(text):
+    text = text.lower()
+    today = datetime.now()
 
-@app.route("/test", methods=["GET"])
+    if "domani" in text:
+        return today + timedelta(days=1)
+    if "dopodomani" in text:
+        return today + timedelta(days=2)
+    if "stasera" in text:
+        return today.replace(hour=18, minute=0)
+
+    try:
+        return parser.parse(text, dayfirst=True, fuzzy=True)
+    except:
+        return None
+
+def parse_time_from_text(text):
+    m = re.search(r"(\d{1,2})([:\.](\d{2}))?", text)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mnt = int(m.group(3) or 0)
+    return time(h, mnt)
+
+# ================= SLOTS =================
+def generate_slots(date, start, end, minutes):
+    slots = []
+    cur = datetime.combine(date.date(), start)
+    stop = datetime.combine(date.date(), end)
+    while cur + timedelta(minutes=minutes) <= stop:
+        slots.append(cur)
+        cur += timedelta(minutes=minutes)
+    return slots
+
+# ================= CORE =================
+def handle_message(shop, phone, text):
+    services = get_services(shop["shop_id"])
+    session = get_session(shop["shop_id"], phone)
+    text_l = text.lower()
+
+    # GREETING
+    if not session:
+        if len(services) > 1:
+            names = "\n".join(f"- {s['name']}" for s in services)
+            return f"Ciao! 💈 Che servizio desideri?\n{names}"
+        return "Ciao! 💈 Quando vuoi venire?"
+
+    # SERVICE
+    if session["state"] == "need_service":
+        for s in services:
+            if s["name"].lower() in text_l:
+                save_session(shop["shop_id"], phone, "need_date", {"service": s})
+                return "Perfetto 👍 Per che giorno?"
+        return "Dimmi che servizio desideri 😊"
+
+    # DATE
+    if session["state"] == "need_date":
+        d = parse_natural_date(text)
+        if not d:
+            return "Dimmi una data valida (es. domani, 17/12)"
+        save_session(shop["shop_id"], phone, "need_time", {"date": d.isoformat()})
+        return "A che ora preferisci?"
+
+    # TIME
+    if session["state"] == "need_time":
+        t = parse_time_from_text(text)
+        if not t:
+            return "Dimmi un orario valido (es. 17:30)"
+
+        return f"✅ Prenotazione confermata alle {t.strftime('%H:%M')}"
+
+    return "Dimmi quando vuoi venire 😊"
+
+# ================= ROUTES =================
+@app.route("/test")
 def test():
     phone = request.args.get("phone", "")
     msg = request.args.get("msg", "")
-
-    if not phone or not msg:
-        return jsonify({"error": "parametri phone e msg richiesti"}), 400
-
-    shop = load_shop(phone)
-
+    shop = find_shop(phone)
     if not shop:
-        return jsonify({"error": "shop non trovato"}), 404
+        return jsonify({"error": "shop non trovato"})
 
-    reply = handle_message(shop, phone, msg)
-
+    reply = handle_message(shop, normalize_phone(phone), msg)
     return jsonify({
-        "shop": shop["name"],
-        "phone": phone,
+        "bot_reply": reply,
         "message_in": msg,
-        "bot_reply": reply
+        "phone": phone,
+        "shop": shop["name"]
     })
 
-# ======================
-# MAIN
-# ======================
+@app.route("/")
+def home():
+    return "SaaS Parrucchieri attivo ✅"
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    app.run(host="0.0.0.0", port=8080)
