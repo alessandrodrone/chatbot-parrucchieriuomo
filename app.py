@@ -32,10 +32,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "30"))
 
-# (opzionale) limite giornate future da cercare
 MAX_LOOKAHEAD_DAYS = int(os.getenv("MAX_LOOKAHEAD_DAYS", "14"))
-
-# (opzionale) cache config tabs
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "20"))
 
 
@@ -49,6 +46,7 @@ _calendar = None
 def _creds():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
+
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -60,21 +58,31 @@ def _creds():
 def sheets():
     global _sheets
     if _sheets is None:
-        _sheets = build("sheets", "v4", credentials=_creds(), cache_discovery=False)
+        _sheets = build(
+            "sheets",
+            "v4",
+            credentials=_creds(),
+            cache_discovery=False,
+        )
     return _sheets
 
 
 def calendar():
     global _calendar
     if _calendar is None:
-        _calendar = build("calendar", "v3", credentials=_creds(), cache_discovery=False)
+        _calendar = build(
+            "calendar",
+            "v3",
+            credentials=_creds(),
+            cache_discovery=False,
+        )
     return _calendar
 
 
 # ============================================================
-# Small cache (reduce API calls)
+# Cache semplice (riduce chiamate API)
 # ============================================================
-_CACHE: Dict[str, Dict[str, Any]] = {}  # key -> {"ts": datetime, "data": ...}
+_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def cache_get(key: str):
@@ -87,7 +95,10 @@ def cache_get(key: str):
 
 
 def cache_set(key: str, data: Any):
-    _CACHE[key] = {"ts": dt.datetime.utcnow(), "data": data}
+    _CACHE[key] = {
+        "ts": dt.datetime.utcnow(),
+        "data": data,
+    }
 
 
 def cache_del(key: str):
@@ -101,27 +112,21 @@ def cache_del(key: str):
 def norm_phone(p: str) -> str:
     """
     Normalizza:
-      - 'whatsapp:+39348...' -> '39348...'
-      - '+39 348...' -> '39348...'
-      - '0039...' -> '3939...' (poi ripulito)
-      - '348...' -> '348...'
+    - whatsapp:+39348... -> 39348...
+    - +39 348...         -> 39348...
+    - 0039...            -> 39...
+    - 348...             -> 348...
     """
     if not p:
         return ""
-    p = p.strip().lower()
-    p = p.replace("whatsapp:", "").strip()
+    p = p.lower().strip()
+    p = p.replace("whatsapp:", "")
     digits = re.sub(r"\D+", "", p)
-    # togli solo zeri iniziali "di formato", non aggressivo
     digits = digits.lstrip("0") or digits
     return digits
 
 
 def phone_matches(a: str, b: str) -> bool:
-    """
-    Match robusto:
-    - confronta digits
-    - accetta con/senza prefisso 39 (Italia)
-    """
     da = norm_phone(a)
     db = norm_phone(b)
     if not da or not db:
@@ -166,14 +171,13 @@ def parse_date(text: str, shop_tz: str) -> Optional[dt.date]:
 
     if "oggi" in t:
         return today
-    if "dopodomani" in t:
-        return today + dt.timedelta(days=2)
     if "domani" in t:
         return today + dt.timedelta(days=1)
+    if "dopodomani" in t:
+        return today + dt.timedelta(days=2)
     if "stasera" in t:
         return today
 
-    # dd/mm(/yyyy)
     m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", t)
     if m:
         d = int(m.group(1))
@@ -185,7 +189,6 @@ def parse_date(text: str, shop_tz: str) -> Optional[dt.date]:
         except ValueError:
             return None
 
-    # weekday (prossimo)
     for k, wd in WEEKDAYS_IT.items():
         if re.search(r"\b" + re.escape(k) + r"\b", t):
             delta = (wd - today.weekday()) % 7
@@ -199,36 +202,22 @@ def parse_date(text: str, shop_tz: str) -> Optional[dt.date]:
 def parse_time(text: str) -> Optional[dt.time]:
     t = (text or "").lower().strip()
 
-    # 17:30 / 17.30
     m = re.search(r"\b([01]?\d|2[0-3])[:\.]([0-5]\d)\b", t)
     if m:
         return dt.time(int(m.group(1)), int(m.group(2)))
 
-    # 1730
     m = re.search(r"\b([01]\d|2[0-3])([0-5]\d)\b", t)
     if m:
         return dt.time(int(m.group(1)), int(m.group(2)))
 
-    # "alle 18" / "ore 18"
     m = re.search(r"\b(?:alle|ore)\s*([01]?\d|2[0-3])\b", t)
     if m:
-        return dt.time(int(m.group(1)), 0)
-
-    # solo "18" se ha contesto
-    m = re.search(r"\b([01]?\d|2[0-3])\b", t)
-    if m and any(x in t for x in ["alle", "ore", "dopo", "prima"]):
         return dt.time(int(m.group(1)), 0)
 
     return None
 
 
 def parse_window(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
-    """
-    Estrae:
-      - "dopo le 18" -> after
-      - "prima delle 17" -> before
-      - fasce: mattina/pomeriggio/sera
-    """
     t = (text or "").lower()
     after = None
     before = None
@@ -241,7 +230,6 @@ def parse_window(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
     if m:
         before = parse_time(m.group(1))
 
-    # fasce
     if "mattina" in t:
         after = after or dt.time(9, 0)
         before = before or dt.time(12, 0)
@@ -253,10 +241,8 @@ def parse_window(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
         before = before or dt.time(22, 0)
 
     return after, before
-
-
-# ============================================================
-# Sheets helpers
+    # ============================================================
+# Google Sheets helpers
 # ============================================================
 def _require_sheet_id():
     if not GOOGLE_SHEET_ID:
@@ -265,7 +251,7 @@ def _require_sheet_id():
 
 def load_tab(tab: str) -> List[Dict[str, str]]:
     """
-    Legge tab completo (A:Z) e lo trasforma in list of dict usando header.
+    Legge un foglio (A:Z) e lo converte in list[dict] usando la riga header.
     Usa cache breve.
     """
     _require_sheet_id()
@@ -305,10 +291,9 @@ def load_tab(tab: str) -> List[Dict[str, str]]:
 
 def _tab_headers(tab: str) -> List[str]:
     _require_sheet_id()
-    rng = f"{tab}!1:1"
     res = sheets().spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range=rng
+        range=f"{tab}!1:1"
     ).execute()
     vals = res.get("values", [[]])
     return [h.strip() for h in (vals[0] if vals else [])]
@@ -316,14 +301,15 @@ def _tab_headers(tab: str) -> List[str]:
 
 def _find_row_index(tab: str, predicate) -> Optional[int]:
     """
-    Ritorna row index 2-based (riga 1 è header).
+    Ritorna l'indice riga (2-based, header = riga 1)
     """
     _require_sheet_id()
-    rng = f"{tab}!A:Z"
+
     res = sheets().spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range=rng
+        range=f"{tab}!A:Z"
     ).execute()
+
     values = res.get("values", [])
     if not values:
         return None
@@ -333,22 +319,23 @@ def _find_row_index(tab: str, predicate) -> Optional[int]:
         obj: Dict[str, str] = {}
         for i, h in enumerate(headers):
             v = row[i] if i < len(row) else ""
-            obj[h] = v.strip() if isinstance(v, str) else (str(v) if v is not None else "")
+            obj[h] = v.strip() if isinstance(v, str) else (str(v) if v else "")
         if predicate(obj):
             return idx
+
     return None
 
 
 def upsert_row(tab: str, key_predicate, data: Dict[str, Any]):
     """
-    UPSERT: se trova la riga (key_predicate) -> update, altrimenti append.
-    Ordina colonne in base agli header esistenti sul foglio.
+    UPSERT su Google Sheets:
+    - se la riga esiste -> UPDATE
+    - altrimenti -> APPEND
     """
     headers = _tab_headers(tab)
     if not headers:
         raise RuntimeError(f"Tab '{tab}' non ha header")
 
-    # prepara row in ordine header
     row_values: List[str] = []
     for h in headers:
         v = data.get(h, "")
@@ -371,18 +358,14 @@ def upsert_row(tab: str, key_predicate, data: Dict[str, Any]):
             body={"values": [row_values]},
         ).execute()
     else:
-        # calcolo colonna finale: A..Z..AA? (qui ci fermiamo a Z: per semplicità)
-        # se hai header > 26 colonne, dimmelo e lo estendiamo.
-        end_col = chr(ord("A") + max(0, len(headers) - 1))
-        rng = f"{tab}!A{row_idx}:{end_col}{row_idx}"
+        end_col = chr(ord("A") + len(headers) - 1)
         sheets().spreadsheets().values().update(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=rng,
+            range=f"{tab}!A{row_idx}:{end_col}{row_idx}",
             valueInputOption="RAW",
             body={"values": [row_values]},
         ).execute()
 
-    # invalida cache tab
     cache_del(f"tab:{tab}")
 
 
@@ -390,52 +373,51 @@ def upsert_row(tab: str, key_predicate, data: Dict[str, Any]):
 # Load shop config (multi-cliente reale)
 # ============================================================
 def load_shop_by_phone(phone: str) -> Optional[Dict[str, str]]:
-    shops = load_tab("shops")
-    for s in shops:
+    for s in load_tab("shops"):
         if phone_matches(phone, s.get("whatsapp_number", "")):
             return s
     return None
 
 
 def load_hours(shop_id: str) -> Dict[int, List[Tuple[dt.time, dt.time]]]:
-    rows = load_tab("hours")
     out: Dict[int, List[Tuple[dt.time, dt.time]]] = {i: [] for i in range(7)}
-    for r in rows:
+
+    for r in load_tab("hours"):
         if (r.get("shop_id") or "").strip() != (shop_id or "").strip():
             continue
         try:
             wd = int(r.get("weekday", ""))
-            st = dt.time.fromisoformat((r.get("start") or "09:00").strip())
-            en = dt.time.fromisoformat((r.get("end") or "19:00").strip())
+            st = dt.time.fromisoformat(r.get("start", "09:00"))
+            en = dt.time.fromisoformat(r.get("end", "19:00"))
             out[wd].append((st, en))
         except Exception:
             continue
+
     for wd in out:
         out[wd].sort(key=lambda x: x[0])
+
     return out
 
 
 def load_services(shop_id: str) -> List[Dict[str, str]]:
-    rows = load_tab("services")
     out: List[Dict[str, str]] = []
-    for r in rows:
+    for r in load_tab("services"):
         if (r.get("shop_id") or "").strip() != (shop_id or "").strip():
             continue
-        # active opzionale: se manca, consideriamo TRUE
-        active_val = (r.get("active") or "TRUE").strip().lower()
-        if active_val == "false":
+        active = (r.get("active") or "TRUE").strip().lower()
+        if active == "false":
             continue
         out.append(r)
     return out
 
 
 # ============================================================
-# Customers (memoria lunga) + Sessions (memoria breve)
+# Customers (memoria lunga)
 # ============================================================
 def get_customer(shop_id: str, phone: str) -> Optional[Dict[str, str]]:
-    rows = load_tab("customers")
-    for r in rows:
-        if (r.get("shop_id") or "").strip() == (shop_id or "").strip() and phone_matches(phone, r.get("phone", "")):
+    for r in load_tab("customers"):
+        if (r.get("shop_id") or "").strip() == (shop_id or "").strip() \
+                and phone_matches(phone, r.get("phone", "")):
             return r
     return None
 
@@ -443,17 +425,18 @@ def get_customer(shop_id: str, phone: str) -> Optional[Dict[str, str]]:
 def upsert_customer(shop_id: str, phone: str, last_service: str):
     now_iso = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     prev = get_customer(shop_id, phone)
+
     total = 0
     if prev:
         try:
-            total = int(prev.get("total_visits", "0") or "0")
+            total = int(prev.get("total_visits", "0"))
         except Exception:
             total = 0
     total += 1
 
     upsert_row(
         "customers",
-        key_predicate=lambda r: (r.get("shop_id") or "").strip() == (shop_id or "").strip()
+        key_predicate=lambda r: (r.get("shop_id") or "") == shop_id
                                 and phone_matches(phone, r.get("phone", "")),
         data={
             "shop_id": shop_id,
@@ -465,18 +448,22 @@ def upsert_customer(shop_id: str, phone: str, last_service: str):
     )
 
 
+# ============================================================
+# Sessions (memoria breve con TTL)
+# ============================================================
 def get_session(shop_id: str, phone: str) -> Optional[Dict[str, Any]]:
-    rows = load_tab("sessions")
-    for r in rows:
-        if (r.get("shop_id") or "").strip() == (shop_id or "").strip() and phone_matches(phone, r.get("phone", "")):
-            raw_data = r.get("data", "") or "{}"
+    for r in load_tab("sessions"):
+        if (r.get("shop_id") or "") == shop_id \
+                and phone_matches(phone, r.get("phone", "")):
+            raw = r.get("data") or "{}"
             try:
-                data_obj = json.loads(raw_data) if isinstance(raw_data, str) else {}
+                data_obj = json.loads(raw)
             except Exception:
                 data_obj = {}
+
             return {
-                "shop_id": r.get("shop_id", shop_id),
-                "phone": r.get("phone", norm_phone(phone)),
+                "shop_id": r.get("shop_id"),
+                "phone": r.get("phone"),
                 "state": r.get("state", ""),
                 "data": data_obj,
                 "updated_at": r.get("updated_at", ""),
@@ -486,9 +473,10 @@ def get_session(shop_id: str, phone: str) -> Optional[Dict[str, Any]]:
 
 def save_session(shop_id: str, phone: str, state: str, data: Dict[str, Any]):
     now_iso = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
     upsert_row(
         "sessions",
-        key_predicate=lambda r: (r.get("shop_id") or "").strip() == (shop_id or "").strip()
+        key_predicate=lambda r: (r.get("shop_id") or "") == shop_id
                                 and phone_matches(phone, r.get("phone", "")),
         data={
             "shop_id": shop_id,
@@ -510,18 +498,16 @@ def session_expired(sess: Dict[str, Any]) -> bool:
         return True
     try:
         ts = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        age_min = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds() / 60
-        return age_min > SESSION_TTL_MINUTES
+        age = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds() / 60
+        return age > SESSION_TTL_MINUTES
     except Exception:
         return True
-
-
 # ============================================================
 # Google Calendar availability + capacity
 # ============================================================
 def count_overlaps(cal_id: str, start: dt.datetime, end: dt.datetime) -> int:
     """
-    Conta quanti eventi si sovrappongono a [start, end)
+    Conta quanti eventi (single events) si sovrappongono a [start, end)
     """
     svc = calendar()
     res = svc.events().list(
@@ -530,18 +516,30 @@ def count_overlaps(cal_id: str, start: dt.datetime, end: dt.datetime) -> int:
         timeMax=end.isoformat(),
         singleEvents=True,
         orderBy="startTime",
-        maxResults=250
+        maxResults=250,
     ).execute()
-    return len(res.get("items", []) or [])
+    items = res.get("items", []) or []
+    return len(items)
 
 
 def slot_has_capacity(cal_id: str, start: dt.datetime, end: dt.datetime, capacity: int) -> bool:
     overlaps = count_overlaps(cal_id, start, end)
-    return overlaps < max(1, capacity)
+    return overlaps < max(1, int(capacity or 1))
 
 
-def create_event(cal_id: str, start: dt.datetime, end: dt.datetime, tz: str, summary: str,
-                 phone: str, service_name: str, shop_name: str):
+def create_event(
+    cal_id: str,
+    start: dt.datetime,
+    end: dt.datetime,
+    tz: str,
+    summary: str,
+    phone: str,
+    service_name: str,
+    shop_name: str,
+):
+    """
+    Crea evento su Google Calendar con metadata utili.
+    """
     svc = calendar()
     ev = {
         "summary": summary,
@@ -557,9 +555,9 @@ def create_event(cal_id: str, start: dt.datetime, end: dt.datetime, tz: str, sum
             "private": {
                 "phone": norm_phone(phone),
                 "service": service_name,
-                "shop": shop_name
+                "shop": shop_name,
             }
-        }
+        },
     }
     svc.events().insert(calendarId=cal_id, body=ev).execute()
 
@@ -569,18 +567,34 @@ def create_event(cal_id: str, start: dt.datetime, end: dt.datetime, tz: str, sum
 # ============================================================
 def round_up_to_slot(dtobj: dt.datetime, slot_minutes: int) -> dt.datetime:
     dtobj = dtobj.replace(second=0, microsecond=0)
-    m = (dtobj.minute // slot_minutes) * slot_minutes
+    sm = max(1, int(slot_minutes or 30))
+    m = (dtobj.minute // sm) * sm
     base = dtobj.replace(minute=m)
     if base < dtobj:
-        base += dt.timedelta(minutes=slot_minutes)
+        base += dt.timedelta(minutes=sm)
     return base
 
 
-def in_open_hours(hours_map: Dict[int, List[Tuple[dt.time, dt.time]]], d: dt.date, start_t: dt.time, end_t: dt.time) -> bool:
+def in_open_hours(
+    hours_map: Dict[int, List[Tuple[dt.time, dt.time]]],
+    d: dt.date,
+    start_t: dt.time,
+    end_t: dt.time,
+) -> bool:
     for st, en in hours_map.get(d.weekday(), []):
         if st <= start_t and end_t <= en:
             return True
     return False
+
+
+def _combine_local(d: dt.date, t: dt.time, tz: str) -> dt.datetime:
+    """
+    Costruisce un datetime timezone-aware se ZoneInfo è disponibile,
+    altrimenti naive.
+    """
+    zi = tzinfo_for(tz)
+    x = dt.datetime.combine(d, t)
+    return x.replace(tzinfo=zi) if zi else x
 
 
 def find_slots(
@@ -594,35 +608,41 @@ def find_slots(
     limit: int = 5,
     max_days: int = 14,
 ) -> List[dt.datetime]:
+    """
+    Trova i prossimi slot disponibili considerando:
+    - orari apertura in 'hours'
+    - durata servizio
+    - slot_minutes
+    - capacity (eventi sovrapposti < capacity)
+    - vincoli after/before (fasce)
+    """
     tz = shop.get("timezone", "Europe/Rome")
-    tzinfo = tzinfo_for(tz)
     slot_minutes = int(shop.get("slot_minutes", "30") or "30")
     capacity = int(shop.get("capacity", "1") or "1")
-    cal_id = shop["calendar_id"]
+    cal_id = shop.get("calendar_id", "")
 
     now_l = now_local(tz)
     today = now_l.date()
+
     base = preferred_date or today
     if base < today:
         base = today
 
-    duration = dt.timedelta(minutes=service_duration_min)
+    duration = dt.timedelta(minutes=max(1, int(service_duration_min or 30)))
     results: List[dt.datetime] = []
 
-    # 1) data+orario preciso: prova prima quello
+    # 1) se ho data + orario preciso -> provo prima quello
     if preferred_date and exact_time:
-        start = dt.datetime.combine(preferred_date, exact_time)
-        if tzinfo:
-            start = start.replace(tzinfo=tzinfo)
+        start = _combine_local(preferred_date, exact_time, tz)
         end = start + duration
 
         if in_open_hours(hours_map, preferred_date, start.time(), end.time()):
-            # non nel passato
             if not (preferred_date == today and start < now_l):
                 if slot_has_capacity(cal_id, start, end, capacity):
                     return [start]
 
     # 2) scan generale
+    max_days = max(0, int(max_days or 14))
     for day_off in range(0, max_days + 1):
         d = base + dt.timedelta(days=day_off)
         ranges = hours_map.get(d.weekday(), [])
@@ -630,28 +650,23 @@ def find_slots(
             continue
 
         for st, en in ranges:
-            start_dt = dt.datetime.combine(d, st)
-            end_dt = dt.datetime.combine(d, en)
-            if tzinfo:
-                start_dt = start_dt.replace(tzinfo=tzinfo)
-                end_dt = end_dt.replace(tzinfo=tzinfo)
+            start_dt = _combine_local(d, st, tz)
+            end_dt = _combine_local(d, en, tz)
 
             # vincoli after/before
             if after:
-                tmp = dt.datetime.combine(d, after)
-                if tzinfo:
-                    tmp = tmp.replace(tzinfo=tzinfo)
-                start_dt = max(start_dt, tmp)
+                tmp = _combine_local(d, after, tz)
+                if tmp > start_dt:
+                    start_dt = tmp
             if before:
-                tmp = dt.datetime.combine(d, before)
-                if tzinfo:
-                    tmp = tmp.replace(tzinfo=tzinfo)
-                end_dt = min(end_dt, tmp)
+                tmp = _combine_local(d, before, tz)
+                if tmp < end_dt:
+                    end_dt = tmp
 
             if end_dt <= start_dt:
                 continue
 
-            # oggi: dal prossimo slot
+            # oggi: dal prossimo slot >= now
             if d == today:
                 start_dt = max(start_dt, round_up_to_slot(now_l, slot_minutes))
 
@@ -667,8 +682,11 @@ def find_slots(
 
 
 def format_slot(shop_tz: str, d: dt.datetime) -> str:
-    tzinfo = tzinfo_for(shop_tz)
-    dd = d.astimezone(tzinfo) if (tzinfo and d.tzinfo) else d
+    """
+    Esempio: "Mer 18/12 18:30"
+    """
+    zi = tzinfo_for(shop_tz)
+    dd = d.astimezone(zi) if (zi and d.tzinfo) else d
     giorni = ["Lun", "Mar", "Mer", "Gio", "Ven", "Sab", "Dom"]
     return f"{giorni[dd.weekday()]} {dd.strftime('%d/%m')} {dd.strftime('%H:%M')}"
 
@@ -679,19 +697,14 @@ def render_slots(shop: Dict[str, str], title: str, slots: List[dt.datetime]) -> 
         lines.append(f"{i}) {format_slot(shop.get('timezone', 'Europe/Rome'), sl)}")
     lines.append("\nRispondi con il numero (1,2,3...) oppure scrivi un giorno/orario diverso.")
     return "\n".join(lines)
-
-
 # ============================================================
-# Services selection + durations + upsell
+# Services selection + upsell helpers
 # ============================================================
 CONFIRM_WORDS = {"ok", "va bene", "confermo", "conferma", "sì", "si", "perfetto", "certo"}
 CANCEL_WORDS = {"annulla", "cancella", "stop", "no", "non va bene", "non confermo"}
 
 
 def service_duration(svc: Dict[str, str]) -> int:
-    """
-    Nel foglio services: duration (preferito) oppure duration_minutes.
-    """
     try:
         return int((svc.get("duration") or svc.get("duration_minutes") or "30").strip())
     except Exception:
@@ -701,54 +714,22 @@ def service_duration(svc: Dict[str, str]) -> int:
 def pick_service_from_text(services: List[Dict[str, str]], text: str) -> Optional[Dict[str, str]]:
     t = (text or "").lower()
 
-    # match per nome completo
     for s in services:
-        name = (s.get("name", "") or "").strip()
-        if name and name.lower() in t:
+        name = (s.get("name", "") or "").lower()
+        if name and name in t:
             return s
 
-    # keywords
     if "barba" in t:
         for s in services:
             if "barba" in (s.get("name", "").lower()):
                 return s
 
-    if "colore" in t or "tinta" in t:
-        for s in services:
-            n = s.get("name", "").lower()
-            if "colore" in n or "tinta" in n:
-                return s
-
-    if "piega" in t:
-        for s in services:
-            if "piega" in s.get("name", "").lower():
-                return s
-
     if "taglio" in t:
         for s in services:
-            if "taglio" in s.get("name", "").lower():
+            if "taglio" in (s.get("name", "").lower()):
                 return s
 
     return None
-
-
-def default_service_if_single(services: List[Dict[str, str]], gender: str) -> Optional[Dict[str, str]]:
-    if len(services) == 1:
-        return services[0]
-
-    # barber uomo: se esiste "Taglio uomo" o simili, default soft
-    if gender == "uomo":
-        preferred = {"taglio", "taglio uomo", "taglio capelli", "taglio uomo (30m)"}
-        for s in services:
-            if (s.get("name", "").lower().strip()) in preferred:
-                return s
-
-    return None
-
-
-def has_service_with_keyword(services: List[Dict[str, str]], kw: str) -> bool:
-    kw = kw.lower()
-    return any(kw in (s.get("name", "").lower()) for s in services)
 
 
 def find_combo_taglio_barba(services: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
@@ -759,12 +740,16 @@ def find_combo_taglio_barba(services: List[Dict[str, str]]) -> Optional[Dict[str
     return None
 
 
+def has_barba_service(services: List[Dict[str, str]]) -> bool:
+    return any("barba" in (s.get("name", "").lower()) for s in services)
+
+
 # ============================================================
-# ✅ CORE BOT LOGIC (avanzata + multi-cliente reale)
+# ✅ CORE BOT LOGIC (FIX DEFINITIVO)
 # ============================================================
 def handle_message(shop: Dict[str, str], phone: str, text: str) -> str:
     tz = shop.get("timezone", "Europe/Rome")
-    shop_id = shop.get("shop_id", "") or shop.get("id", "") or ""
+    shop_id = shop.get("shop_id", "")
     shop_name = shop.get("name", "il salone")
     gender = (shop.get("gender", "unisex") or "unisex").lower()
     capacity = int(shop.get("capacity", "1") or "1")
@@ -775,339 +760,158 @@ def handle_message(shop: Dict[str, str], phone: str, text: str) -> str:
     t = (text or "").strip()
     tlow = t.lower().strip()
 
-    # session
+    # =========================
+    # Session
+    # =========================
     sess = get_session(shop_id, phone)
     if sess and session_expired(sess):
         reset_session(shop_id, phone)
         sess = None
 
-    # CANCEL
-    if any(w in tlow for w in CANCEL_WORDS):
-        reset_session(shop_id, phone)
-        return "Ok 👍 Nessun problema. Se vuoi riprenotare, dimmi pure giorno e orario (es. “domani alle 18”)."
-
-    # GREETING
-    if tlow in {"ciao", "salve", "buongiorno", "buonasera", "hey"} and not sess:
-        cust = get_customer(shop_id, phone)
-        if cust and cust.get("last_service"):
-            return (
-                f"Ciao! 👋 Sei in contatto con *{shop_name}* 💈\n"
-                f"Ultima volta hai fatto: *{cust.get('last_service')}*.\n\n"
-                f"Quando vuoi prenotare?"
-            )
-        return (
-            f"Ciao! 👋 Sei in contatto con *{shop_name}* 💈\n"
-            f"Dimmi quando vuoi prenotare 😊"
-        )
-
-    # PARSE
-    date_ = parse_date(t, tz)
-    exact_time = parse_time(t)
-    after, before = parse_window(t)
-
-    wants_booking = (
-        any(x in tlow for x in ["prenot", "appunt", "posto", "disponib", "libero"]) or
-        bool(date_) or bool(exact_time) or bool(after) or bool(before)
-    )
-
-    # chosen service from text
-    chosen_service: Optional[Dict[str, str]] = pick_service_from_text(services, t) if services else None
-
-    # if session already contains service
     state = (sess.get("state") if sess else "") or ""
     data = (sess.get("data") if sess else {}) or {}
     if not isinstance(data, dict):
         data = {}
 
-    if data.get("service"):
-        chosen_service = data.get("service")
-
-    # if no service, default soft
-    if not chosen_service and services:
-        default = default_service_if_single(services, gender)
-        if default:
-            chosen_service = default
-
-    # if user is not really booking: help
-    if not wants_booking:
-        if not chosen_service and (gender in {"donna", "unisex"}) and len(services) > 1:
-            s_list = "\n".join([f"• {s.get('name')}" for s in services[:10]])
-            return (
-                f"Per aiutarti meglio 😊 che servizio desideri?\n{s_list}\n\n"
-                f"Poi dimmi giorno e orario (es. “domani alle 18”)."
-            )
-        return "Dimmi pure quando vuoi venire (es. “domani alle 18” o “mercoledì dopo le 17:30”)."
-
-    # ========================================================
-    # STATE: choose (utente sceglie 1/2/3)
-    # ========================================================
-    if state == "choose":
-        options = data.get("options") or []
-        service = data.get("service") or chosen_service
-
-        m = re.search(r"\b(\d{1,2})\b", tlow)
-        if m and options:
-            idx = int(m.group(1)) - 1
-            if 0 <= idx < len(options):
-                start = dt.datetime.fromisoformat(options[idx])
-                save_session(shop_id, phone, "confirm", {
-                    "service": service,
-                    "slot_iso": start.isoformat(),
-                    "upsell_barba_done": data.get("upsell_barba_done", False),
-                })
-                return (
-                    f"Confermi questo appuntamento?\n"
-                    f"💈 *{service.get('name', 'Servizio')}*\n"
-                    f"🕒 {format_slot(tz, start)}\n\n"
-                    f"Rispondi *OK* per confermare oppure *annulla*."
-                )
-
-        # se non ha scelto un numero valido, trattiamo come nuova richiesta
+    # =========================
+    # CANCEL
+    # =========================
+    if any(w in tlow for w in CANCEL_WORDS):
         reset_session(shop_id, phone)
-        state = ""
-        data = {}
+        return "Ok 👍 Nessun problema. Se vuoi riprenotare dimmi pure giorno e orario."
 
-    # ========================================================
-    # STATE: confirm
-    # ========================================================
-    if state == "confirm":
-        if tlow in CONFIRM_WORDS:
-            slot_iso = data.get("slot_iso")
-            service = data.get("service")
-            if not slot_iso or not service:
-                reset_session(shop_id, phone)
-                return "Ops, ho perso i dettagli 😅 Ripartiamo: quando vuoi venire?"
-
-            start = dt.datetime.fromisoformat(slot_iso)
-            dur = service_duration(service)
-            end = start + dt.timedelta(minutes=dur)
-
-            # re-check capacity
-            if not slot_has_capacity(shop["calendar_id"], start, end, capacity):
-                reset_session(shop_id, phone)
-                alt = find_slots(shop, hours_map, dur, start.date(), None, None, None, limit=5, max_days=7)
-                if not alt:
-                    return "Quello slot è appena stato preso 😅 Vuoi indicarmi un’altra fascia?"
-                save_session(shop_id, phone, "choose", {"service": service, "options": [x.isoformat() for x in alt]})
-                return render_slots(shop, "Quell’orario non è più disponibile. Ecco alcune alternative:", alt)
-
-            # create event
-            create_event(
-                cal_id=shop["calendar_id"],
-                start=start,
-                end=end,
-                tz=tz,
-                summary=f"{shop_name} - {service.get('name', 'Servizio')}",
-                phone=phone,
-                service_name=service.get("name", ""),
-                shop_name=shop_name
-            )
-
-            upsert_customer(shop_id, phone, service.get("name", ""))
-            reset_session(shop_id, phone)
-
-            return (
-                f"✅ Perfetto! Ti ho prenotato da *{shop_name}*.\n"
-                f"💈 *{service.get('name','Servizio')}*\n"
-                f"🕒 {format_slot(tz, start)}\n\n"
-                f"A presto 👋"
-            )
-
-        # se non conferma, riparti senza bloccare
-        reset_session(shop_id, phone)
-        state = ""
-        data = {}
-
-    # ========================================================
-    # Se mancano info servizio
-    # ========================================================
-    if not chosen_service and len(services) > 1:
-        s_list = "\n".join([f"• {s.get('name')}" for s in services[:10]])
-        save_session(shop_id, phone, "need_service", {"asked": True})
+    # =========================
+    # GREETING
+    # =========================
+    if tlow in {"ciao", "salve", "buongiorno", "buonasera"} and not sess:
         return (
-            f"Perfetto 😊 Per che servizio vuoi prenotare da *{shop_name}*?\n"
-            f"{s_list}\n\n"
-            f"Scrivimi ad esempio: “{services[0].get('name','Taglio')} domani alle 18”."
+            f"Ciao! 👋 Sei in contatto con *{shop_name}* 💈\n"
+            f"Dimmi quando vuoi prenotare 😊"
         )
 
-    if state == "need_service":
-        svc = pick_service_from_text(services, t)
-        if not svc:
-            s_list = "\n".join([f"• {s.get('name')}" for s in services[:10]])
-            return f"Dimmi il servizio desiderato:\n{s_list}"
-        chosen_service = svc  # continuiamo sotto
+    # =========================
+    # PARSING
+    # =========================
+    date_ = parse_date(t, tz)
+    exact_time = parse_time(t)
+    after, before = parse_window(t)
 
-    # ========================================================
-    # ✅ Upsell soft (solo 1 volta)
-    # ========================================================
-    # Caso barber uomo: Taglio -> chiedi se vuole barba (solo se esiste un servizio barba o combo)
-    if gender == "uomo" and chosen_service:
-        chosen_name = (chosen_service.get("name", "") or "").lower()
-        barba_available = has_service_with_keyword(services, "barba")
-        combo = find_combo_taglio_barba(services)
+    # =========================
+    # SERVICE
+    # =========================
+    chosen_service = data.get("service") or pick_service_from_text(services, t)
+    if not chosen_service and services:
+        if len(services) == 1:
+            chosen_service = services[0]
 
-        if "taglio" in chosen_name and barba_available and not data.get("upsell_barba_done") and "barba" not in tlow:
-            data["upsell_barba_done"] = True
-            save_session(shop_id, phone, "upsell_barba", {"service": chosen_service, **data})
-            return (
-                "Perfetto 👍 Vuoi aggiungere anche la *barba* oppure solo *taglio*?\n"
-                "• Scrivi “solo taglio” oppure “taglio e barba”."
-            )
-
-        if state == "upsell_barba":
-            # se dice taglio e barba -> seleziona combo se esiste
-            if ("taglio e barba" in tlow or ("taglio" in tlow and "barba" in tlow)) and combo:
+    # =========================
+    # UPSALE BARBA (FIX)
+    # =========================
+    if state == "upsell_barba":
+        # 👉 FIX QUI
+        if "solo taglio" in tlow:
+            chosen_service = data["service"]
+        elif ("taglio e barba" in tlow or ("taglio" in tlow and "barba" in tlow)):
+            combo = find_combo_taglio_barba(services)
+            if combo:
                 chosen_service = combo
-            # altrimenti prosegui col taglio scelto
-            # non forziamo.
+        # continuiamo senza perdere data/orario
+        state = ""
+        save_session(shop_id, phone, "", {
+            **data,
+            "service": chosen_service,
+            "upsell_barba_done": True
+        })
 
-    # ========================================================
-    # Se manca quando
-    # ========================================================
+    # =========================
+    # UPSALE (trigger)
+    # =========================
+    if (
+        gender == "uomo"
+        and chosen_service
+        and "taglio" in chosen_service.get("name", "").lower()
+        and has_barba_service(services)
+        and not data.get("upsell_barba_done")
+        and "barba" not in tlow
+    ):
+        save_session(shop_id, phone, "upsell_barba", {
+            **data,
+            "service": chosen_service,
+            "upsell_barba_done": True
+        })
+        return (
+            "Perfetto 👍 Vuoi aggiungere anche la *barba* oppure solo *taglio*?\n"
+            "• Scrivi “solo taglio” oppure “taglio e barba”."
+        )
+
+    # =========================
+    # WHEN missing
+    # =========================
     if chosen_service and not date_ and not exact_time and not after and not before:
-        save_session(shop_id, phone, "need_when", {"service": chosen_service, **data})
-        return "Quando preferisci venire? (es. “domani alle 18”, “mercoledì dopo le 17:30”)."
+        save_session(shop_id, phone, "need_when", {"service": chosen_service})
+        return "Quando preferisci venire? (es. “domani alle 18”)."
 
-    # Se ha solo data
     if chosen_service and date_ and not exact_time and not after and not before:
-        save_session(shop_id, phone, "need_time", {"service": chosen_service, "date": date_.isoformat(), **data})
-        return f"Ok 👍 {date_.strftime('%d/%m')} a che ora preferisci? (es. 18:00) oppure una fascia (es. “dopo le 18”)."
+        save_session(shop_id, phone, "need_time", {
+            "service": chosen_service,
+            "date": date_.isoformat()
+        })
+        return f"Ok 👍 {date_.strftime('%d/%m')} a che ora?"
 
-    # Se ha solo orario/fascia
     if chosen_service and (exact_time or after or before) and not date_:
-        payload = {"service": chosen_service, **data}
-        if exact_time:
-            payload["time"] = exact_time.isoformat()
-        if after:
-            payload["after"] = after.isoformat()
-        if before:
-            payload["before"] = before.isoformat()
-        save_session(shop_id, phone, "need_date", payload)
-        return "Perfetto 👍 Per che giorno? (es. “domani”, “mercoledì”, “17/12”)."
+        save_session(shop_id, phone, "need_date", {
+            "service": chosen_service,
+            "time": exact_time.isoformat() if exact_time else "",
+            "after": after.isoformat() if after else "",
+            "before": before.isoformat() if before else "",
+        })
+        return "Perfetto 👍 Per che giorno?"
 
-    # Recupero dati se in state need_date/need_time
+    # =========================
+    # RECOVER STATE
+    # =========================
     if state == "need_date":
-        d = parse_date(t, tz)
-        if not d:
-            return "Ok 😊 Dimmi il giorno (es. “domani”, “mercoledì”, “17/12”)."
-        date_ = d
-        if data.get("time") and not exact_time:
-            try:
-                exact_time = dt.time.fromisoformat(data["time"])
-            except Exception:
-                pass
-        if data.get("after") and not after:
-            try:
-                after = dt.time.fromisoformat(data["after"])
-            except Exception:
-                pass
-        if data.get("before") and not before:
-            try:
-                before = dt.time.fromisoformat(data["before"])
-            except Exception:
-                pass
+        date_ = parse_date(t, tz)
+        if not date_:
+            return "Dimmi il giorno (es. domani, mercoledì, 17/12)."
 
     if state == "need_time":
-        if data.get("date"):
-            try:
-                date_ = dt.date.fromisoformat(data["date"])
-            except Exception:
-                pass
+        exact_time = parse_time(t)
         if not exact_time:
-            exact_time = parse_time(t)
-        a2, b2 = parse_window(t)
-        after = after or a2
-        before = before or b2
-        if not exact_time and not after and not before:
-            return "Dimmi un orario valido (es. 18:00) oppure una fascia (es. “dopo le 18”)."
+            return "Dimmi un orario valido (es. 18:00)."
 
-    # fallback servizio
-    if not chosen_service:
-        if services:
-            chosen_service = services[0]
-        else:
-            chosen_service = {"name": "Appuntamento", "duration": "30"}
-
+    # =========================
+    # FIND SLOTS
+    # =========================
     dur = service_duration(chosen_service)
-
-    # ========================================================
-    # BOOKING: data+ora precisa
-    # ========================================================
-    if date_ and exact_time:
-        slots = find_slots(
-            shop, hours_map, dur,
-            preferred_date=date_,
-            exact_time=exact_time,
-            after=None, before=None,
-            limit=5, max_days=min(MAX_LOOKAHEAD_DAYS, 14)
-        )
-
-        # se disponibile esattamente
-        if slots and slots[0].date() == date_ and slots[0].time() == exact_time:
-            start = slots[0]
-            save_session(shop_id, phone, "confirm", {
-                "service": chosen_service,
-                "slot_iso": start.isoformat(),
-                "upsell_barba_done": data.get("upsell_barba_done", False)
-            })
-            return (
-                f"Perfetto 👍 Confermi?\n"
-                f"💈 *{chosen_service.get('name','Servizio')}*\n"
-                f"🕒 {format_slot(tz, start)}\n\n"
-                f"Rispondi *OK* per confermare oppure *annulla*."
-            )
-
-        # non disponibile: proponi alternative vicine
-        if not slots:
-            return "Non vedo disponibilità in quel momento. Vuoi indicarmi un’altra fascia (es. “dopo le 18”)?"
-
-        save_session(shop_id, phone, "choose", {
-            "service": chosen_service,
-            "options": [x.isoformat() for x in slots],
-            "upsell_barba_done": data.get("upsell_barba_done", False)
-        })
-        return render_slots(shop, "A quell’ora non riesco 😅 Posso proporti questi orari vicini:", slots)
-
-    # ========================================================
-    # BOOKING: data + fascia
-    # ========================================================
-    if date_ and (after or before) and not exact_time:
-        slots = find_slots(
-            shop, hours_map, dur,
-            preferred_date=date_,
-            exact_time=None,
-            after=after, before=before,
-            limit=5, max_days=min(MAX_LOOKAHEAD_DAYS, 14)
-        )
-        if not slots:
-            return "In quella fascia non vedo posti liberi 😕 Vuoi provare un altro orario o un altro giorno?"
-        save_session(shop_id, phone, "choose", {
-            "service": chosen_service,
-            "options": [x.isoformat() for x in slots],
-            "upsell_barba_done": data.get("upsell_barba_done", False)
-        })
-        return render_slots(shop, "Perfetto 👍 Ecco alcune disponibilità:", slots)
-
-    # ========================================================
-    # BOOKING: richiesta generica -> prossimi slot
-    # ========================================================
-    base_date = date_ or now_local(tz).date()
     slots = find_slots(
-        shop, hours_map, dur,
-        preferred_date=base_date,
-        exact_time=None,
-        after=after, before=before,
-        limit=5, max_days=min(MAX_LOOKAHEAD_DAYS, 14)
+        shop,
+        hours_map,
+        dur,
+        preferred_date=date_,
+        exact_time=exact_time,
+        after=after,
+        before=before,
+        limit=5,
+        max_days=14
     )
-    if not slots:
-        return "Non vedo disponibilità a breve 😕 Dimmi un giorno preciso o una fascia (es. “mercoledì dopo le 18”)."
 
-    save_session(shop_id, phone, "choose", {
+    if not slots:
+        return "Non vedo disponibilità 😕 Vuoi un altro giorno o fascia?"
+
+    start = slots[0]
+
+    save_session(shop_id, phone, "confirm", {
         "service": chosen_service,
-        "options": [x.isoformat() for x in slots],
-        "upsell_barba_done": data.get("upsell_barba_done", False)
+        "slot_iso": start.isoformat()
     })
-    return render_slots(shop, "Ecco i prossimi orari liberi:", slots)
+
+    return (
+        f"Perfetto 👍 Confermi questo appuntamento?\n"
+        f"💈 *{chosen_service.get('name')}*\n"
+        f"🕒 {format_slot(tz, start)}\n\n"
+        f"Rispondi *OK* per confermare oppure *annulla*."
+    )
 
 
 # ============================================================
@@ -1120,18 +924,13 @@ def home():
 
 @app.route("/test", methods=["GET"])
 def test():
-    """
-    Esempio:
-      /test?phone=393481111111&msg=ciao
-      /test?phone=393481111111&msg=domani%20alle%2018
-    """
     phone = request.args.get("phone", "")
     msg = request.args.get("msg", "ciao")
 
     try:
         shop = load_shop_by_phone(phone)
         if not shop:
-            return jsonify({"error": "shop non trovato", "phone": phone}), 404
+            return jsonify({"error": "shop non trovato"}), 404
 
         reply = handle_message(shop, phone, msg)
         return jsonify({
@@ -1140,18 +939,11 @@ def test():
             "message_in": msg,
             "bot_reply": reply
         })
-    except HttpError as e:
-        # errori Google API (permessi, API disabilitata, ecc.)
-        return jsonify({"error": "google_api_error", "details": str(e)}), 500
     except Exception as e:
         return jsonify({"error": "server_error", "details": str(e)}), 500
 
 
-# Placeholder WhatsApp Cloud API (lo attiviamo quando Meta sblocca)
 @app.route("/wa", methods=["POST"])
 def wa_placeholder():
-    return jsonify({"ok": True, "note": "Webhook WhatsApp Cloud API non configurato in questa fase."})
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    return jsonify({"ok": True})
+    
