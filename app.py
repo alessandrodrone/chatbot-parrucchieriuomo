@@ -4,12 +4,11 @@ import os
 import re
 import json
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 try:
     from zoneinfo import ZoneInfo
@@ -17,32 +16,27 @@ except Exception:
     ZoneInfo = None
 
 
-# ============================================================
-# FLASK APP (gunicorn app:app)
-# ============================================================
+# =====================================================
+# Flask (OBBLIGATORIO per gunicorn app:app)
+# =====================================================
 app = Flask(__name__)
 
-
-# ============================================================
+# =====================================================
 # ENV
-# ============================================================
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+# =====================================================
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "30"))
-MAX_LOOKAHEAD_DAYS = int(os.getenv("MAX_LOOKAHEAD_DAYS", "14"))
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "20"))
+MAX_LOOKAHEAD_DAYS = 14
 
-
-# ============================================================
-# GOOGLE CLIENTS (lazy)
-# ============================================================
+# =====================================================
+# Google clients
+# =====================================================
 _sheets = None
 _calendar = None
 
 
-def _creds():
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
+def creds():
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -53,76 +47,28 @@ def _creds():
 
 def sheets():
     global _sheets
-    if _sheets is None:
-        _sheets = build("sheets", "v4", credentials=_creds(), cache_discovery=False)
+    if not _sheets:
+        _sheets = build("sheets", "v4", credentials=creds(), cache_discovery=False)
     return _sheets
 
 
 def calendar():
     global _calendar
-    if _calendar is None:
-        _calendar = build("calendar", "v3", credentials=_creds(), cache_discovery=False)
+    if not _calendar:
+        _calendar = build("calendar", "v3", credentials=creds(), cache_discovery=False)
     return _calendar
 
 
-# ============================================================
-# CACHE
-# ============================================================
-_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
-def cache_get(key: str):
-    item = _CACHE.get(key)
-    if not item:
-        return None
-    if (dt.datetime.utcnow() - item["ts"]).total_seconds() > CACHE_TTL_SECONDS:
-        return None
-    return item["data"]
-
-
-def cache_set(key: str, data: Any):
-    _CACHE[key] = {"ts": dt.datetime.utcnow(), "data": data}
-
-
-def cache_del(key: str):
-    if key in _CACHE:
-        del _CACHE[key]
-
-
-# ============================================================
-# PHONE HELPERS
-# ============================================================
+# =====================================================
+# Utils
+# =====================================================
 def norm_phone(p: str) -> str:
-    if not p:
-        return ""
-    p = p.replace("whatsapp:", "")
-    digits = re.sub(r"\D+", "", p)
-    return digits.lstrip("0") or digits
+    return re.sub(r"\D+", "", (p or "").replace("whatsapp:", ""))
 
 
 def phone_matches(a: str, b: str) -> bool:
-    da, db = norm_phone(a), norm_phone(b)
-    if da == db:
-        return True
-    if da.startswith("39") and da[2:] == db:
-        return True
-    if db.startswith("39") and db[2:] == da:
-        return True
-    return False
-
-
-# ============================================================
-# DATE / TIME PARSING (IT)
-# ============================================================
-WEEKDAYS_IT = {
-    "lunedi": 0, "lunedì": 0, "lun": 0,
-    "martedi": 1, "martedì": 1, "mar": 1,
-    "mercoledi": 2, "mercoledì": 2, "mer": 2,
-    "giovedi": 3, "giovedì": 3, "gio": 3,
-    "venerdi": 4, "venerdì": 4, "ven": 4,
-    "sabato": 5, "sab": 5,
-    "domenica": 6, "dom": 6,
-}
+    a, b = norm_phone(a), norm_phone(b)
+    return a == b or a.endswith(b) or b.endswith(a)
 
 
 def tzinfo_for(tz: str):
@@ -134,186 +80,204 @@ def now_local(tz: str):
     return dt.datetime.now(zi) if zi else dt.datetime.now()
 
 
+# =====================================================
+# Parsing data / ora (IT)
+# =====================================================
 def parse_date(text: str, tz: str) -> Optional[dt.date]:
     t = text.lower()
     today = now_local(tz).date()
-
     if "oggi" in t:
         return today
-    if "dopodomani" in t:
-        return today + dt.timedelta(days=2)
     if "domani" in t:
         return today + dt.timedelta(days=1)
-    if "stasera" in t:
-        return today
+    if "dopodomani" in t:
+        return today + dt.timedelta(days=2)
 
-    m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", t)
+    m = re.search(r"(\d{1,2})[\/\-](\d{1,2})", t)
     if m:
-        d, mth = int(m.group(1)), int(m.group(2))
-        y = int(m.group(3)) if m.group(3) else today.year
-        if y < 100:
-            y += 2000
         try:
-            return dt.date(y, mth, d)
+            return dt.date(today.year, int(m.group(2)), int(m.group(1)))
         except Exception:
             return None
-
-    for k, wd in WEEKDAYS_IT.items():
-        if k in t:
-            delta = (wd - today.weekday()) % 7
-            if delta == 0:
-                delta = 7
-            return today + dt.timedelta(days=delta)
-
     return None
 
 
 def parse_time(text: str) -> Optional[dt.time]:
-    t = text.lower()
-
-    m = re.search(r"([01]?\d|2[0-3])[:\.]([0-5]\d)", t)
+    m = re.search(r"([01]?\d|2[0-3])[:\.]?([0-5]\d)?", text)
     if m:
-        return dt.time(int(m.group(1)), int(m.group(2)))
-
-    m = re.search(r"\b(alle|ore)\s*([01]?\d|2[0-3])\b", t)
-    if m:
-        return dt.time(int(m.group(2)), 0)
-
+        return dt.time(int(m.group(1)), int(m.group(2) or 0))
     return None
 
 
-def parse_window(text: str):
-    t = text.lower()
-    after = before = None
-
-    if "mattina" in t:
-        after, before = dt.time(9, 0), dt.time(12, 0)
-    if "pomeriggio" in t:
-        after, before = dt.time(14, 0), dt.time(19, 0)
-    if "sera" in t:
-        after, before = dt.time(17, 30), dt.time(22, 0)
-
-    return after, before
-
-
-# ============================================================
-# GOOGLE SHEETS
-# ============================================================
+# =====================================================
+# Sheets helpers
+# =====================================================
 def load_tab(tab: str) -> List[Dict[str, str]]:
-    key = f"tab:{tab}"
-    cached = cache_get(key)
-    if cached is not None:
-        return cached
-
     res = sheets().spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
         range=f"{tab}!A:Z"
     ).execute()
-
     values = res.get("values", [])
     if not values:
         return []
-
     headers = values[0]
-    rows = []
+    out = []
     for r in values[1:]:
-        obj = {}
-        for i, h in enumerate(headers):
-            obj[h] = r[i] if i < len(r) else ""
-        rows.append(obj)
-
-    cache_set(key, rows)
-    return rows
+        out.append({headers[i]: r[i] if i < len(r) else "" for i in range(len(headers))})
+    return out
 
 
-# ============================================================
-# LOAD CONFIG
-# ============================================================
-def load_shop_by_phone(phone: str):
+def upsert_row(tab: str, match_fn, data: Dict[str, str]):
+    rows = load_tab(tab)
+    headers = rows[0].keys() if rows else data.keys()
+    for i, r in enumerate(rows):
+        if match_fn(r):
+            idx = i + 2
+            sheets().spreadsheets().values().update(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                range=f"{tab}!A{idx}",
+                valueInputOption="RAW",
+                body={"values": [[data.get(h, "") for h in headers]]}
+            ).execute()
+            return
+    sheets().spreadsheets().values().append(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{tab}!A:Z",
+        valueInputOption="RAW",
+        body={"values": [[data.get(h, "") for h in headers]]}
+    ).execute()
+
+
+# =====================================================
+# Load config
+# =====================================================
+def load_shop(phone: str):
     for s in load_tab("shops"):
-        if phone_matches(phone, s.get("whatsapp_number", "")):
+        if phone_matches(phone, s.get("whatsapp_number")):
             return s
     return None
 
 
+def load_services(shop_id: str):
+    return [s for s in load_tab("services") if s.get("shop_id") == shop_id]
+
+
 def load_hours(shop_id: str):
     out = {i: [] for i in range(7)}
-    for r in load_tab("hours"):
-        if r.get("shop_id") != shop_id:
-            continue
-        out[int(r["weekday"])].append(
-            (dt.time.fromisoformat(r["start"]), dt.time.fromisoformat(r["end"]))
-        )
+    for h in load_tab("hours"):
+        if h.get("shop_id") == shop_id:
+            out[int(h["weekday"])].append(
+                (dt.time.fromisoformat(h["start"]), dt.time.fromisoformat(h["end"]))
+            )
     return out
 
 
-def load_services(shop_id: str):
-    out = []
-    for r in load_tab("services"):
-        if r.get("shop_id") == shop_id and r.get("active", "TRUE") != "FALSE":
-            out.append(r)
-    return out
+# =====================================================
+# Session
+# =====================================================
+def get_session(shop_id: str, phone: str):
+    for r in load_tab("sessions"):
+        if r.get("shop_id") == shop_id and phone_matches(phone, r.get("phone")):
+            return r
+    return None
 
 
-# ============================================================
-# CORE LOGIC (SEMPLIFICATA MA ROBUSTA)
-# ============================================================
-def handle_message(shop: dict, phone: str, text: str) -> str:
-    name = shop.get("name", "il salone")
-    tz = shop.get("timezone", "Europe/Rome")
-
-    if text.lower() in {"ciao", "salve", "buongiorno", "buonasera"}:
-        return (
-            f"Ciao! 👋 Sei in contatto con *{name}* 💈\n"
-            f"Dimmi quando vuoi prenotare 😊"
-        )
-
-    date_ = parse_date(text, tz)
-    time_ = parse_time(text)
-
-    if date_ and time_:
-        return (
-            f"Perfetto 👍 Sto controllando la disponibilità per "
-            f"{date_.strftime('%d/%m')} alle {time_.strftime('%H:%M')}.\n"
-            f"Un attimo ⏳"
-        )
-
-    return (
-        "Dimmi pure quando vuoi venire "
-        "(es. *domani alle 18*, *venerdì pomeriggio*)."
+def save_session(shop_id: str, phone: str, state: str, data: dict):
+    upsert_row(
+        "sessions",
+        lambda r: r.get("shop_id") == shop_id and phone_matches(phone, r.get("phone")),
+        {
+            "shop_id": shop_id,
+            "phone": norm_phone(phone),
+            "state": state,
+            "data": json.dumps(data),
+            "updated_at": dt.datetime.utcnow().isoformat()
+        }
     )
 
 
-# ============================================================
+def reset_session(shop_id: str, phone: str):
+    save_session(shop_id, phone, "", {})
+
+
+# =====================================================
+# CORE BOT (FIX DEFINITIVO)
+# =====================================================
+def handle_message(shop: dict, phone: str, text: str) -> str:
+    tz = shop["timezone"]
+    shop_id = shop["shop_id"]
+    services = load_services(shop_id)
+
+    sess = get_session(shop_id, phone)
+    state = sess.get("state") if sess else ""
+    data = json.loads(sess["data"]) if sess and sess.get("data") else {}
+
+    # Greeting
+    if text.lower() in {"ciao", "salve"} and not state:
+        return f"Ciao! 👋 Sei in contatto con *{shop['name']}* 💈\nDimmi quando vuoi prenotare 😊"
+
+    date = data.get("date") or parse_date(text, tz)
+    time = data.get("time") or parse_time(text)
+
+    service = data.get("service")
+    if not service:
+        for s in services:
+            if s["name"].lower() in text.lower():
+                service = s
+                break
+
+    # UPSell FIX
+    if state == "upsell_barba":
+        if "taglio e barba" in text.lower():
+            for s in services:
+                if "taglio" in s["name"].lower() and "barba" in s["name"].lower():
+                    service = s
+        # 🔥 CONTINUA SENZA PERDERE DATA/ORA
+        save_session(shop_id, phone, "booking", {
+            "service": service,
+            "date": date.isoformat() if date else None,
+            "time": time.isoformat() if time else None
+        })
+        return f"Perfetto 👍 Sto cercando disponibilità per {date.strftime('%d/%m')} alle {time.strftime('%H:%M')}"
+
+    # Richiesta upsell
+    if service and "taglio" in service["name"].lower() and not data.get("upsell_done"):
+        save_session(shop_id, phone, "upsell_barba", {
+            "service": service,
+            "date": date.isoformat() if date else None,
+            "time": time.isoformat() if time else None,
+            "upsell_done": True
+        })
+        return "Vuoi aggiungere anche la *barba* o solo *taglio*?"
+
+    if not date or not time:
+        save_session(shop_id, phone, "need_when", data)
+        return "Dimmi quando vuoi venire (es. domani alle 18)"
+
+    return f"✅ Prenotazione in corso: {service['name']} il {date.strftime('%d/%m')} alle {time.strftime('%H:%M')}"
+
+
+# =====================================================
 # ROUTES
-# ============================================================
-@app.route("/")
-def home():
-    return "SaaS Parrucchieri attivo ✅"
-
-
+# =====================================================
 @app.route("/test")
 def test():
-    phone = request.args.get("phone", "")
-    msg = request.args.get("msg", "ciao")
+    phone = request.args.get("phone")
+    msg = request.args.get("msg", "")
+    shop = load_shop(phone)
+    if not shop:
+        return jsonify({"error": "shop non trovato"}), 404
+    return jsonify({
+        "shop": shop["name"],
+        "phone": phone,
+        "message_in": msg,
+        "bot_reply": handle_message(shop, phone, msg)
+    })
 
-    try:
-        shop = load_shop_by_phone(phone)
-        if not shop:
-            return jsonify({"error": "shop non trovato"}), 404
 
-        reply = handle_message(shop, phone, msg)
-        return jsonify({
-            "shop": shop.get("name"),
-            "phone": phone,
-            "message_in": msg,
-            "bot_reply": reply
-        })
-
-    except HttpError as e:
-        return jsonify({"error": "google_api_error", "details": str(e)}), 500
-    except Exception as e:
-        return jsonify({"error": "server_error", "details": str(e)}), 500
+@app.route("/")
+def home():
+    return "Bot attivo ✅"
 
 
 @app.route("/wa", methods=["POST"])
@@ -322,4 +286,4 @@ def wa_placeholder():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
