@@ -826,10 +826,8 @@ def handle_message(shop: Dict[str, str], phone: str, text: str) -> str:
     # =========================
     # UPSALE (trigger)
     # =========================
-    if (
-        gender == "uomo"
-        and chosen_service
-        and "taglio" in chosen_service.get("name", "").lower()
+    if gender == "uomo" and isinstance(chosen_service, dict):
+    chosen_name = (chosen_service.get("name") or "").lower()
         and has_barba_service(services)
         and not data.get("upsell_barba_done")
         and "barba" not in tlow
