@@ -1,129 +1,140 @@
 from __future__ import annotations
-import os, json, re
+
+import os
+import json
+import re
+import datetime as dt
 from flask import Flask, request, jsonify
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# =====================
-# CONFIG
-# =====================
-APP = Flask(__name__)
+# ======================
+# APP
+# ======================
+app = Flask(__name__)
 
+# ======================
+# ENV
+# ======================
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # es: 1BsS-P9rmxmsn11uAIwUjZ2xShdtsdmBssUNeb06p8cU
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-# =====================
+if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEET_ID:
+    raise RuntimeError("Variabili GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_SHEET_ID mancanti")
+
+# ======================
 # GOOGLE SHEETS
-# =====================
+# ======================
 def sheets_service():
     creds = service_account.Credentials.from_service_account_info(
         json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
     )
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-def load_sheet(sheet_name: str):
-    svc = sheets_service()
-    res = svc.spreadsheets().values().get(
+def load_sheet(tab_name: str) -> list[dict]:
+    service = sheets_service()
+    result = service.spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range=sheet_name,
+        range=tab_name
     ).execute()
 
-    values = res.get("values", [])
+    values = result.get("values", [])
     if not values:
         return []
 
-    headers = values[0]
-    rows = values[1:]
+    headers = [h.strip() for h in values[0]]
+    rows = []
 
-    out = []
-    for r in rows:
-        row = {}
+    for row in values[1:]:
+        item = {}
         for i, h in enumerate(headers):
-            row[h] = r[i] if i < len(r) else ""
-        out.append(row)
-    return out
+            item[h] = row[i].strip() if i < len(row) else ""
+        rows.append(item)
 
-# =====================
-# PHONE NORMALIZATION (FONDAMENTALE)
-# =====================
-def normalize_phone(raw: str) -> str:
-    """
-    Accetta:
-    +393481111111
-    whatsapp:+393481111111
-    3481111111
-    00393481111111
+    return rows
 
-    Ritorna SOLO numeri, senza prefissi
+# ======================
+# UTILS
+# ======================
+def normalize_phone(p: str) -> str:
     """
-    if not raw:
+    Rimuove tutto tranne numeri.
+    +39 348 111111 → 393481111111
+    whatsapp:+39348... → 39348...
+    """
+    if not p:
         return ""
+    return re.sub(r"\D", "", p)
 
-    p = raw.lower()
-    p = p.replace("whatsapp:", "")
-    p = p.replace("+", "")
-    p = p.replace(" ", "")
-    p = p.replace("-", "")
-    p = p.replace("(", "").replace(")", "")
-
-    # se inizia con 00 (es: 0039)
-    if p.startswith("00"):
-        p = p[2:]
-
-    return p
-
-# =====================
+# ======================
 # SHOP LOOKUP
-# =====================
-def load_shop(phone_raw: str):
-    phone = normalize_phone(phone_raw)
+# ======================
+def load_shop(phone: str):
+    phone_n = normalize_phone(phone)
 
     shops = load_sheet("shops")
 
+    print("DEBUG phone ricevuto:", phone)
+    print("DEBUG phone normalizzato:", phone_n)
+    print("DEBUG shops:", shops)
+
     for s in shops:
         sheet_phone = normalize_phone(s.get("whatsapp_number", ""))
+        print("CONFRONTO:", phone_n, "VS", sheet_phone)
 
-        # MATCH PRINCIPALE
-        if phone == sheet_phone:
-            return s
-
-        # MATCH SENZA 39 (caso italiano)
-        if phone.endswith(sheet_phone) or sheet_phone.endswith(phone):
+        if phone_n == sheet_phone:
             return s
 
     return None
 
-# =====================
-# TEST ENDPOINT
-# =====================
-@APP.route("/test", methods=["GET"])
+# ======================
+# LOGICA CHAT (MINIMA)
+# ======================
+def handle_message(shop: dict, phone: str, msg: str) -> str:
+    msg_l = msg.lower()
+
+    if msg_l in {"ciao", "salve", "buongiorno", "buonasera"}:
+        return (
+            f"Ciao! 👋\n"
+            f"Sei in contatto con *{shop['name']}* 💈\n\n"
+            f"Dimmi quando vuoi prenotare 😊"
+        )
+
+    return "Perfetto 👍 Dimmi giorno e ora (es. domani alle 18)."
+
+# ======================
+# ROUTES
+# ======================
+@app.route("/")
+def home():
+    return "Chatbot Parrucchieri attivo ✅"
+
+@app.route("/test", methods=["GET"])
 def test():
     phone = request.args.get("phone", "")
     msg = request.args.get("msg", "")
 
+    if not phone or not msg:
+        return jsonify({"error": "parametri phone e msg richiesti"}), 400
+
     shop = load_shop(phone)
 
     if not shop:
-        return jsonify({
-            "error": "shop non trovato",
-            "phone_received": phone,
-            "phone_normalized": normalize_phone(phone),
-        }), 404
+        return jsonify({"error": "shop non trovato"}), 404
+
+    reply = handle_message(shop, phone, msg)
 
     return jsonify({
-        "reply": f"Ciao! 💈 Benvenuto da {shop.get('name')}. Dimmi quando vuoi venire.",
-        "shop": shop,
-        "phone_received": phone,
-        "phone_normalized": normalize_phone(phone),
+        "shop": shop["name"],
+        "phone": phone,
+        "message_in": msg,
+        "bot_reply": reply
     })
 
-# =====================
-# HOME
-# =====================
-@APP.route("/")
-def home():
-    return "SaaS Parrucchieri attivo ✅"
-
+# ======================
+# MAIN
+# ======================
 if __name__ == "__main__":
-    APP.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
