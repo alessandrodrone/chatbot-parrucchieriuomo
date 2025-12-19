@@ -88,7 +88,7 @@ def cache_set(key: str, data: Any):
 
 def cache_del(key: str):
     if key in _CACHE:
-        del _CACHE[key)
+        del _CACHE[key]
 
 
 # ============================================================
