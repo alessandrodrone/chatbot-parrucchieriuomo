@@ -1,28 +1,34 @@
+from __future__ import annotations
+import os, re, json, datetime as dt
+from typing import Optional, Dict, Any, List
 from flask import Flask, request, jsonify
-import datetime as dt
-import re
-import json
-import difflib
-import os
 
+# ============================================================
+# APP
+# ============================================================
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
 SESSION_TTL_MIN = 30
-SLOT_MINUTES = 30
-MAX_LOOKAHEAD_DAYS = 14
 
-# =========================
-# SESSION STORAGE (in-memory semplice)
-# =========================
-SESSIONS = {}
+# ============================================================
+# MOCK / STORAGE (usa Sheets/DB nella tua versione prod)
+# ============================================================
+SESSIONS: Dict[str, Dict[str, Any]] = {}
 
+# ============================================================
+# HELPERS
+# ============================================================
 def now():
     return dt.datetime.now()
 
-def get_session(key):
+def normalize_phone(p: str) -> str:
+    return re.sub(r"\D+", "", p or "")
+
+def session_key(shop: str, customer: str) -> str:
+    return f"{shop}:{customer}"
+
+def get_session(shop: str, customer: str) -> Dict[str, Any]:
+    key = session_key(shop, customer)
     s = SESSIONS.get(key)
     if not s:
         return {}
@@ -31,183 +37,181 @@ def get_session(key):
         return {}
     return s["data"]
 
-def save_session(key, data):
-    SESSIONS[key] = {
+def save_session(shop: str, customer: str, data: Dict[str, Any]):
+    SESSIONS[session_key(shop, customer)] = {
         "data": data,
         "updated": now()
     }
 
-def reset_session(key):
-    if key in SESSIONS:
-        del SESSIONS[key]
+def reset_session(shop: str, customer: str):
+    SESSIONS.pop(session_key(shop, customer), None)
 
-# =========================
-# NLP UTILS
-# =========================
-def normalize(text):
-    return re.sub(r"[^a-z0-9 ]", "", text.lower())
+# ============================================================
+# NLP SEMPLICE (robusto)
+# ============================================================
+def fuzzy_match(word: str, target: str) -> bool:
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, word, target).ratio() > 0.7
 
-def fuzzy_match(word, choices):
-    matches = difflib.get_close_matches(word, choices, n=1, cutoff=0.6)
-    return matches[0] if matches else None
-
-# =========================
-# DATE / TIME PARSER
-# =========================
-def parse_date(text):
-    t = normalize(text)
-    today = dt.date.today()
-
-    if "domani" in t:
-        return today + dt.timedelta(days=1)
-    if "dopodomani" in t:
-        return today + dt.timedelta(days=2)
-
-    return None
-
-def parse_time(text):
-    m = re.search(r"\b([01]?\d|2[0-3])[:\.]?([0-5]\d)?\b", text)
-    if not m:
-        return None
-    h = int(m.group(1))
-    mnt = int(m.group(2)) if m.group(2) else 0
-    return dt.time(h, mnt)
-
-# =========================
-# SERVICES
-# =========================
-SERVICES = [
-    {"name": "taglio uomo", "duration": 30},
-    {"name": "barba", "duration": 20},
-    {"name": "taglio e barba", "duration": 50},
-    {"name": "piega", "duration": 30},
-    {"name": "colore", "duration": 90},
-    {"name": "ceretta", "duration": 20},
-]
-
-SERVICE_NAMES = [s["name"] for s in SERVICES]
-
-def detect_service(text):
-    words = normalize(text).split()
+def detect_service(text: str, services: List[str]) -> Optional[str]:
+    words = re.findall(r"[a-zàèéìòù]+", text.lower())
     for w in words:
-        m = fuzzy_match(w, SERVICE_NAMES)
-        if m:
-            return next(s for s in SERVICES if s["name"] == m)
+        for s in services:
+            if fuzzy_match(w, s.lower()):
+                return s
     return None
 
-# =========================
-# AVAILABILITY MOCK
-# =========================
-def get_available_slots(date, duration):
+def detect_date_time(text: str):
+    text = text.lower()
+    today = now().date()
+
+    date = None
+    if "domani" in text:
+        date = today + dt.timedelta(days=1)
+    elif "oggi" in text:
+        date = today
+
+    time = None
+    m = re.search(r"(\d{1,2})(?:[:\.](\d{2}))?", text)
+    if m:
+        h = int(m.group(1))
+        mnt = int(m.group(2) or 0)
+        if 0 <= h <= 23:
+            time = dt.time(h, mnt)
+
+    fascia = None
+    if "sera" in text or "pomeriggio" in text:
+        fascia = "sera"
+
+    return date, time, fascia
+
+# ============================================================
+# AGENDA FURBA (PRUDENTE)
+# ============================================================
+def find_best_slot(requested_dt: Optional[dt.datetime]) -> List[dt.datetime]:
+    base = requested_dt or now() + dt.timedelta(hours=2)
     slots = []
-    start = dt.datetime.combine(date, dt.time(9, 0))
-    end = dt.datetime.combine(date, dt.time(19, 0))
 
-    cur = start
-    while cur + dt.timedelta(minutes=duration) <= end:
-        slots.append(cur)
-        cur += dt.timedelta(minutes=30)
+    # stesso giorno ±30 min
+    for delta in [0, 30, -30]:
+        s = base + dt.timedelta(minutes=delta)
+        if s > now():
+            slots.append(s)
 
-    return slots[:5]
+    # stesso orario giorno dopo
+    slots.append(base + dt.timedelta(days=1))
 
-# =========================
-# CORE BOT
-# =========================
-def handle_message(session_key, text):
-    t = text.lower()
-    s = get_session(session_key)
+    # fallback: primo slot disponibile
+    slots.append(now() + dt.timedelta(hours=3))
 
-    # ---- cancel
-    if any(x in t for x in ["annulla", "stop", "no"]):
-        reset_session(session_key)
-        return "Va bene 👍 Quando vuoi riprenotare?"
+    # dedup
+    seen = set()
+    out = []
+    for s in slots:
+        k = s.strftime("%Y-%m-%d %H:%M")
+        if k not in seen:
+            seen.add(k)
+            out.append(s)
+    return out[:3]
 
-    # ---- detect service
-    service = detect_service(text)
-    if service:
-        s["service"] = service
+def fmt(dtobj: dt.datetime) -> str:
+    giorni = ["Lun","Mar","Mer","Gio","Ven","Sab","Dom"]
+    return f"{giorni[dtobj.weekday()]} {dtobj.strftime('%d/%m %H:%M')}"
 
-    # ---- detect date/time
-    date = parse_date(text)
-    time = parse_time(text)
-
-    if date:
-        s["date"] = date.isoformat()
-    if time:
-        s["time"] = time.strftime("%H:%M")
-
-    save_session(session_key, s)
-
-    # ---- if missing service
-    if "service" not in s:
-        return (
-            "Perfetto 😊 Che servizio desideri?\n"
-            "• Taglio uomo\n"
-            "• Barba\n"
-            "• Taglio e barba\n"
-            "• Piega\n"
-            "• Colore"
-        )
-
-    # ---- if missing date or time
-    if "date" not in s or "time" not in s:
-        return "Quando preferisci venire? (es. domani alle 18)"
-
-    # ---- check availability
-    date_obj = dt.date.fromisoformat(s["date"])
-    time_obj = dt.time.fromisoformat(s["time"])
-    service = s["service"]
-
-    slots = get_available_slots(date_obj, service["duration"])
-
-    exact = dt.datetime.combine(date_obj, time_obj)
-
-    if exact in slots:
-        s["confirm"] = exact.isoformat()
-        save_session(session_key, s)
-        return (
-            f"Perfetto 👍 Confermi?\n"
-            f"💈 {service['name']}\n"
-            f"🕒 {exact.strftime('%d/%m %H:%M')}\n\n"
-            f"Rispondi OK per confermare"
-        )
-
-    # ---- alternatives (smart)
-    alt = slots[:2]
-    msg = (
-        f"Domani alle {time_obj.strftime('%H:%M')} è già occupato 😕\n"
-        f"Posso però offrirti:\n"
-    )
-    for a in alt:
-        msg += f"• {a.strftime('%H:%M')}\n"
-    msg += "\nDimmi cosa preferisci 😊"
-
-    s["options"] = [a.isoformat() for a in alt]
-    save_session(session_key, s)
-    return msg
-
-# =========================
-# ROUTES
-# =========================
+# ============================================================
+# CORE LOGIC
+# ============================================================
 @app.route("/test")
 def test():
-    shop = request.args.get("phone")
-    customer = request.args.get("customer")
-    msg = request.args.get("msg", "")
+    shop = normalize_phone(request.args.get("phone"))
+    customer = normalize_phone(request.args.get("customer"))
+    msg = (request.args.get("msg") or "").strip()
 
-    key = f"{shop}:{customer}"
-    reply = handle_message(key, msg)
+    services = ["taglio", "barba", "taglio + barba", "piega", "colore", "ceretta"]
 
-    return jsonify({
+    sess = get_session(shop, customer)
+
+    # CANCEL
+    if msg.lower() in {"annulla", "cancella", "no"}:
+        reset_session(shop, customer)
+        return jsonify(reply(
+            shop, customer,
+            "Va bene 👍 se vuoi riprenotare sono qui."
+        ))
+
+    # GREETING
+    if not sess and msg.lower() in {"ciao", "salve", "buongiorno"}:
+        return jsonify(reply(
+            shop, customer,
+            "Ciao! 👋 Dimmi quando vorresti venire e per che servizio 😊"
+        ))
+
+    # PARSE
+    service = sess.get("service") or detect_service(msg, services)
+    date, time, fascia = detect_date_time(msg)
+
+    if service:
+        sess["service"] = service
+
+    if date or time or fascia:
+        sess["date"] = date.isoformat() if date else sess.get("date")
+        sess["time"] = time.isoformat() if time else sess.get("time")
+
+    # CHIEDI SERVIZIO SE MANCA
+    if not sess.get("service"):
+        save_session(shop, customer, sess)
+        return jsonify(reply(
+            shop, customer,
+            "Perfetto 😊 che servizio desideri? (es. *taglio*, *taglio + barba*, *piega*)"
+        ))
+
+    # COSTRUISCI RICHIESTA
+    req_dt = None
+    if sess.get("date") and sess.get("time"):
+        d = dt.date.fromisoformat(sess["date"])
+        t = dt.time.fromisoformat(sess["time"])
+        req_dt = dt.datetime.combine(d, t)
+
+    # TROVA SLOT
+    slots = find_best_slot(req_dt)
+
+    # SE CLIENTE VAGO O RIFIUTA TUTTO
+    if msg.lower() in {"non posso", "non va bene", "nessuno"}:
+        best = slots[0]
+        reset_session(shop, customer)
+        return jsonify(reply(
+            shop, customer,
+            f"Va bene 👍 allora ti propongo la prima disponibilità utile:\n🕒 *{fmt(best)}*\nVa bene per te?"
+        ))
+
+    # CONFERMA
+    if msg.lower() in {"ok", "va bene", "sì", "si"} and sess.get("pending"):
+        reset_session(shop, customer)
+        return jsonify(reply(
+            shop, customer,
+            f"✅ Appuntamento confermato!\n💈 *{sess['service']}*\n🕒 {sess['pending']}\nA presto 👋"
+        ))
+
+    # PROPOSTA
+    best = slots[0]
+    sess["pending"] = fmt(best)
+    save_session(shop, customer, sess)
+
+    return jsonify(reply(
+        shop, customer,
+        f"Purtroppo l’orario richiesto non è disponibile 😕\n"
+        f"Posso però offrirti:\n"
+        f"🕒 *{fmt(best)}*\n"
+        f"Va bene per te?"
+    ))
+
+def reply(shop, customer, text):
+    return {
         "shop_number": shop,
         "customer": customer,
-        "message_in": msg,
-        "bot_reply": reply
-    })
+        "bot_reply": text
+    }
 
-@app.route("/")
-def home():
-    return "RispondiTu v2 attivo ✅"
-
+# ============================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
