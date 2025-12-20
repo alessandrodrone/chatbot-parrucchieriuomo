@@ -91,8 +91,6 @@ def parse_fascia(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
 # FUZZY SERVICE MATCH
 # ============================================================
 def fuzzy_service(text: str, services: List[Dict]) -> Optional[Dict]:
-    if not services:
-        return None
     names = [s["name"] for s in services]
     match = difflib.get_close_matches(
         text.lower(),
@@ -118,10 +116,7 @@ def load_tab(tab: str) -> List[Dict]:
     if not rows:
         return []
     headers = rows[0]
-    return [
-        dict(zip(headers, r + [""]*(len(headers)-len(r))))
-        for r in rows[1:]
-    ]
+    return [dict(zip(headers, r + [""]*(len(headers)-len(r)))) for r in rows[1:]]
 
 def load_shop(phone: str) -> Optional[Dict]:
     for s in load_tab("shops"):
@@ -137,13 +132,12 @@ def load_hours(shop_id: str) -> Dict[int, List[Tuple[dt.time, dt.time]]]:
     for r in load_tab("hours"):
         if r.get("shop_id") == shop_id:
             out[int(r["weekday"])].append(
-                (dt.time.fromisoformat(r["start"]),
-                 dt.time.fromisoformat(r["end"]))
+                (dt.time.fromisoformat(r["start"]), dt.time.fromisoformat(r["end"]))
             )
     return out
 
 # ============================================================
-# SESSION (memory breve)
+# SESSION (MEMORIA BREVE)
 # ============================================================
 SESSIONS: Dict[str, Dict] = {}
 
@@ -172,68 +166,72 @@ def slot_free(cal_id, start, end):
     return len(evs) == 0
 
 # ============================================================
-# CORE LOGIC (COPY v4 + SICUREZZA)
+# CORE BOT LOGIC v3.1
 # ============================================================
 def handle(shop, customer, text):
     key = f"{shop['shop_id']}:{customer}"
     sess = get_session(key)
+
     services = load_services(shop["shop_id"])
     hours = load_hours(shop["shop_id"])
-    t = text.lower().strip()
 
-    # ---- GREETING
-    if t in {"ciao","salve","buongiorno","buonasera","hey"}:
+    low = text.lower()
+
+    # 1️⃣ GREETING
+    if low in {"ciao","salve","buongiorno","buonasera"} and not sess:
         return (
             f"Ciao! 👋 Sono l’assistente di *{shop['name']}*.\n"
             f"Ti aiuto a fissare l’appuntamento in pochi secondi 😊\n\n"
-            f"Quando preferisci venire? (es. “domani alle 18”, “sabato pomeriggio”)"
+            f"Dimmi pure cosa ti serve."
         )
 
-    # ---- FUZZY / SERVICE
-    service = fuzzy_service(t, services)
-    if service:
-        sess["service"] = service
-        save_session(key, sess)
-    elif "service" not in sess:
-        lst = "\n".join(f"• {s['name']}" for s in services)
-        return (
-            "Nessun problema 😊\n"
-            "Dimmi solo che servizio ti serve:\n"
-            f"{lst}"
-        )
+    # 2️⃣ SERVIZIO (UNA SOLA VOLTA)
+    if "service" not in sess:
+        service = fuzzy_service(text, services)
+        if service:
+            sess["service"] = service
+            save_session(key, sess)
+        else:
+            lst = "\n".join(f"• {s['name']}" for s in services)
+            return (
+                "Nessun problema 😊\n"
+                "Dimmi solo che servizio ti serve:\n"
+                f"{lst}"
+            )
 
-    # ---- DATE / TIME / FASCIA
-    d = parse_date(t)
-    tm = parse_time(t)
-    a,b = parse_fascia(t)
+    # 3️⃣ DATA / ORARIO
+    d = parse_date(text)
+    t = parse_time(text)
+    a,b = parse_fascia(text)
 
     if d:
         sess["date"] = d
-    if tm:
-        sess["time"] = tm
+    if t:
+        sess["time"] = t
     if a:
         sess["after"], sess["before"] = a,b
 
     save_session(key, sess)
 
-    # ---- GUIDA UMANA
     if "date" not in sess:
         return (
             "Perfetto 👍\n"
-            "In che giorno ti è più comodo?\n"
-            "(es. “domani”, “sabato”, “martedì”)"
+            "Quando preferisci venire?\n"
+            "(es. *domani*, *sabato*, *questa settimana*)"
         )
 
     if "time" not in sess and "after" not in sess:
         return (
-            "Preferisci *mattina*, *pomeriggio* o *sera*? 😊"
+            "Va bene 😊\n"
+            "Preferisci *mattina*, *pomeriggio* o *sera*?"
         )
 
-    # ---- SLOT SEARCH INTELLIGENTE
+    # 4️⃣ CERCA SLOT MIGLIORE
     dur = int(sess["service"].get("duration",30))
     cal_id = shop["calendar_id"]
     base = sess["date"]
-    found = []
+
+    found_slots = []
 
     for day in range(MAX_LOOKAHEAD_DAYS):
         dday = base + dt.timedelta(days=day)
@@ -241,43 +239,26 @@ def handle(shop, customer, text):
             cur = dt.datetime.combine(dday, st)
             while cur + dt.timedelta(minutes=dur) <= dt.datetime.combine(dday,en):
                 if slot_free(cal_id, cur, cur+dt.timedelta(minutes=dur)):
-                    found.append(cur)
-                    if len(found) >= 3:
-                        break
+                    found_slots.append(cur)
                 cur += dt.timedelta(minutes=SLOT_MINUTES)
-        if found:
+        if found_slots:
             break
 
-    if not found:
+    if not found_slots:
         return (
             "Al momento non vedo disponibilità 😕\n"
-            "Dimmi un altro giorno o una fascia diversa e riproviamo 👍"
+            "Vuoi provare un altro giorno?"
         )
 
-    # ---- SPIEGA + PROPOSTA
-    if len(found) == 1:
-        slot = found[0]
-        sess["slot"] = slot
-        save_session(key, sess)
-        return (
-            "Ottimo 😊 Ho trovato questo posto:\n\n"
-            f"💈 *{sess['service']['name']}*\n"
-            f"🕒 {slot.strftime('%a %d/%m %H:%M')}\n\n"
-            "Confermi? Rispondi *OK* oppure scrivi un altro orario."
-        )
-
-    # alternative
-    lines = []
-    for i,s in enumerate(found,1):
-        lines.append(f"{i}) {s.strftime('%a %d/%m %H:%M')}")
-    sess["options"] = found
+    best = found_slots[0]
+    sess["slot"] = best
     save_session(key, sess)
 
     return (
-        "Capito 😊 L’orario che hai chiesto è occupato.\n"
-        "Posso però offrirti queste alternative:\n\n"
-        + "\n".join(lines) +
-        "\n\nRispondi con il numero oppure scrivi un orario diverso."
+        f"Ti propongo questo orario 👇\n\n"
+        f"💈 *{sess['service']['name']}*\n"
+        f"🕒 {best.strftime('%a %d/%m %H:%M')}\n\n"
+        f"Va bene per te? Rispondi *OK* oppure dimmi un’altra preferenza 😊"
     )
 
 # ============================================================
