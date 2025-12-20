@@ -1,217 +1,212 @@
 from __future__ import annotations
-import os, re, json, datetime as dt
-from typing import Optional, Dict, Any, List
+import os, re, json, difflib
+import datetime as dt
+from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
-# ============================================================
-# APP
-# ============================================================
+# =====================================================
+# FLASK / GUNICORN
+# =====================================================
 app = Flask(__name__)
 
+# =====================================================
+# ENV
+# =====================================================
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 SESSION_TTL_MIN = 30
+MAX_LOOKAHEAD_DAYS = 14
 
-# ============================================================
-# MOCK / STORAGE (usa Sheets/DB nella tua versione prod)
-# ============================================================
-SESSIONS: Dict[str, Dict[str, Any]] = {}
+# =====================================================
+# GOOGLE CLIENTS
+# =====================================================
+def creds():
+    return service_account.Credentials.from_service_account_info(
+        json.loads(SERVICE_ACCOUNT_JSON),
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/calendar"
+        ]
+    )
 
-# ============================================================
+_sheets = _calendar = None
+
+def sheets():
+    global _sheets
+    if not _sheets:
+        _sheets = build("sheets", "v4", credentials=creds(), cache_discovery=False)
+    return _sheets
+
+def calendar():
+    global _calendar
+    if not _calendar:
+        _calendar = build("calendar", "v3", credentials=creds(), cache_discovery=False)
+    return _calendar
+
+# =====================================================
 # HELPERS
-# ============================================================
-def now():
-    return dt.datetime.now()
-
-def normalize_phone(p: str) -> str:
+# =====================================================
+def norm_phone(p: str) -> str:
     return re.sub(r"\D+", "", p or "")
 
-def session_key(shop: str, customer: str) -> str:
-    return f"{shop}:{customer}"
+def fuzzy_match(text: str, choices: List[str]) -> Optional[str]:
+    matches = difflib.get_close_matches(text.lower(), choices, n=1, cutoff=0.6)
+    return matches[0] if matches else None
 
-def get_session(shop: str, customer: str) -> Dict[str, Any]:
-    key = session_key(shop, customer)
-    s = SESSIONS.get(key)
-    if not s:
-        return {}
-    if (now() - s["updated"]).total_seconds() / 60 > SESSION_TTL_MIN:
-        del SESSIONS[key]
-        return {}
-    return s["data"]
+def now():
+    return dt.datetime.utcnow()
 
-def save_session(shop: str, customer: str, data: Dict[str, Any]):
-    SESSIONS[session_key(shop, customer)] = {
-        "data": data,
-        "updated": now()
-    }
+# =====================================================
+# SHEETS
+# =====================================================
+def load_tab(tab: str) -> List[Dict[str, str]]:
+    res = sheets().spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=f"{tab}!A:Z"
+    ).execute()
+    rows = res.get("values", [])
+    if not rows:
+        return []
+    headers = rows[0]
+    out = []
+    for r in rows[1:]:
+        obj = {}
+        for i, h in enumerate(headers):
+            obj[h] = r[i] if i < len(r) else ""
+        out.append(obj)
+    return out
 
-def reset_session(shop: str, customer: str):
-    SESSIONS.pop(session_key(shop, customer), None)
-
-# ============================================================
-# NLP SEMPLICE (robusto)
-# ============================================================
-def fuzzy_match(word: str, target: str) -> bool:
-    from difflib import SequenceMatcher
-    return SequenceMatcher(None, word, target).ratio() > 0.7
-
-def detect_service(text: str, services: List[str]) -> Optional[str]:
-    words = re.findall(r"[a-zàèéìòù]+", text.lower())
-    for w in words:
-        for s in services:
-            if fuzzy_match(w, s.lower()):
-                return s
+# =====================================================
+# SHOP RESOLUTION
+# =====================================================
+def get_shop(shop_number: str) -> Optional[Dict[str, str]]:
+    for s in load_tab("shops"):
+        if norm_phone(s.get("whatsapp_number")) == norm_phone(shop_number):
+            return s
     return None
 
-def detect_date_time(text: str):
-    text = text.lower()
+# =====================================================
+# SESSION (SHORT MEMORY)
+# =====================================================
+_SESS: Dict[str, Dict[str, Any]] = {}
+
+def get_session(key: str) -> Dict[str, Any]:
+    s = _SESS.get(key)
+    if not s or (now() - s["ts"]).total_seconds() > SESSION_TTL_MIN * 60:
+        _SESS[key] = {"ts": now(), "data": {}}
+    return _SESS[key]["data"]
+
+def save_session(key: str, data: Dict[str, Any]):
+    _SESS[key] = {"ts": now(), "data": data}
+
+def reset_session(key: str):
+    _SESS.pop(key, None)
+
+# =====================================================
+# TIME PARSING (IT)
+# =====================================================
+def parse_date(text: str) -> Optional[dt.date]:
+    t = text.lower()
     today = now().date()
+    if "domani" in t:
+        return today + dt.timedelta(days=1)
+    if "oggi" in t:
+        return today
+    return None
 
-    date = None
-    if "domani" in text:
-        date = today + dt.timedelta(days=1)
-    elif "oggi" in text:
-        date = today
+def parse_time(text: str) -> Optional[dt.time]:
+    m = re.search(r"(\d{1,2})[:\.]?(\d{2})?", text)
+    if not m:
+        return None
+    h = int(m.group(1))
+    mnt = int(m.group(2)) if m.group(2) else 0
+    if 0 <= h <= 23:
+        return dt.time(h, mnt)
+    return None
 
-    time = None
-    m = re.search(r"(\d{1,2})(?:[:\.](\d{2}))?", text)
-    if m:
-        h = int(m.group(1))
-        mnt = int(m.group(2) or 0)
-        if 0 <= h <= 23:
-            time = dt.time(h, mnt)
-
-    fascia = None
-    if "sera" in text or "pomeriggio" in text:
-        fascia = "sera"
-
-    return date, time, fascia
-
-# ============================================================
-# AGENDA FURBA (PRUDENTE)
-# ============================================================
-def find_best_slot(requested_dt: Optional[dt.datetime]) -> List[dt.datetime]:
-    base = requested_dt or now() + dt.timedelta(hours=2)
-    slots = []
-
-    # stesso giorno ±30 min
-    for delta in [0, 30, -30]:
-        s = base + dt.timedelta(minutes=delta)
-        if s > now():
-            slots.append(s)
-
-    # stesso orario giorno dopo
-    slots.append(base + dt.timedelta(days=1))
-
-    # fallback: primo slot disponibile
-    slots.append(now() + dt.timedelta(hours=3))
-
-    # dedup
-    seen = set()
-    out = []
-    for s in slots:
-        k = s.strftime("%Y-%m-%d %H:%M")
-        if k not in seen:
-            seen.add(k)
-            out.append(s)
-    return out[:3]
-
-def fmt(dtobj: dt.datetime) -> str:
-    giorni = ["Lun","Mar","Mer","Gio","Ven","Sab","Dom"]
-    return f"{giorni[dtobj.weekday()]} {dtobj.strftime('%d/%m %H:%M')}"
-
-# ============================================================
+# =====================================================
 # CORE LOGIC
-# ============================================================
+# =====================================================
+def handle_message(shop: Dict[str, str], customer: str, text: str) -> str:
+    key = f"{shop['shop_id']}:{customer}"
+    sess = get_session(key)
+    text_l = text.lower()
+
+    # --- cancel
+    if any(x in text_l for x in ["annulla", "cancella", "stop"]):
+        reset_session(key)
+        return "Va bene 👍 Se vuoi riprenotare dimmi pure quando."
+
+    # --- greeting
+    if text_l in ["ciao", "salve", "buongiorno", "buonasera"] and not sess:
+        return f"Ciao! 👋 Sei in contatto con *{shop['name']}* 💈\nDimmi quando vuoi prenotare 😊"
+
+    # --- parse intent
+    date = parse_date(text)
+    time = parse_time(text)
+
+    # --- services
+    services = [s["name"] for s in load_tab("services") if s["shop_id"] == shop["shop_id"]]
+    chosen = fuzzy_match(text_l, [s.lower() for s in services])
+
+    if chosen:
+        sess["service"] = chosen
+
+    if date:
+        sess["date"] = date.isoformat()
+    if time:
+        sess["time"] = time.strftime("%H:%M")
+
+    save_session(key, sess)
+
+    # --- missing service
+    if "service" not in sess:
+        return (
+            f"Perfetto 😊 Per che servizio vuoi prenotare da *{shop['name']}*?\n" +
+            "\n".join(f"• {s}" for s in services)
+        )
+
+    # --- missing date/time
+    if "date" not in sess or "time" not in sess:
+        return "Quando preferisci venire? (es. “domani alle 18”, “sabato pomeriggio”)."
+
+    # --- CONFIRM
+    d = dt.date.fromisoformat(sess["date"])
+    t = dt.time.fromisoformat(sess["time"])
+    return (
+        "Confermi questo appuntamento?\n"
+        f"💈 *{sess['service']}*\n"
+        f"🕒 {d.strftime('%a %d/%m')} {t.strftime('%H:%M')}\n\n"
+        "Rispondi *OK* per confermare oppure *annulla*."
+    )
+
+# =====================================================
+# ROUTE
+# =====================================================
 @app.route("/test")
 def test():
-    shop = normalize_phone(request.args.get("phone"))
-    customer = normalize_phone(request.args.get("customer"))
-    msg = (request.args.get("msg") or "").strip()
+    shop_number = request.args.get("phone")
+    customer = request.args.get("customer")
+    msg = request.args.get("msg", "")
 
-    services = ["taglio", "barba", "taglio + barba", "piega", "colore", "ceretta"]
+    shop = get_shop(shop_number)
+    if not shop:
+        return jsonify({"error": "shop not found"}), 404
 
-    sess = get_session(shop, customer)
-
-    # CANCEL
-    if msg.lower() in {"annulla", "cancella", "no"}:
-        reset_session(shop, customer)
-        return jsonify(reply(
-            shop, customer,
-            "Va bene 👍 se vuoi riprenotare sono qui."
-        ))
-
-    # GREETING
-    if not sess and msg.lower() in {"ciao", "salve", "buongiorno"}:
-        return jsonify(reply(
-            shop, customer,
-            "Ciao! 👋 Dimmi quando vorresti venire e per che servizio 😊"
-        ))
-
-    # PARSE
-    service = sess.get("service") or detect_service(msg, services)
-    date, time, fascia = detect_date_time(msg)
-
-    if service:
-        sess["service"] = service
-
-    if date or time or fascia:
-        sess["date"] = date.isoformat() if date else sess.get("date")
-        sess["time"] = time.isoformat() if time else sess.get("time")
-
-    # CHIEDI SERVIZIO SE MANCA
-    if not sess.get("service"):
-        save_session(shop, customer, sess)
-        return jsonify(reply(
-            shop, customer,
-            "Perfetto 😊 che servizio desideri? (es. *taglio*, *taglio + barba*, *piega*)"
-        ))
-
-    # COSTRUISCI RICHIESTA
-    req_dt = None
-    if sess.get("date") and sess.get("time"):
-        d = dt.date.fromisoformat(sess["date"])
-        t = dt.time.fromisoformat(sess["time"])
-        req_dt = dt.datetime.combine(d, t)
-
-    # TROVA SLOT
-    slots = find_best_slot(req_dt)
-
-    # SE CLIENTE VAGO O RIFIUTA TUTTO
-    if msg.lower() in {"non posso", "non va bene", "nessuno"}:
-        best = slots[0]
-        reset_session(shop, customer)
-        return jsonify(reply(
-            shop, customer,
-            f"Va bene 👍 allora ti propongo la prima disponibilità utile:\n🕒 *{fmt(best)}*\nVa bene per te?"
-        ))
-
-    # CONFERMA
-    if msg.lower() in {"ok", "va bene", "sì", "si"} and sess.get("pending"):
-        reset_session(shop, customer)
-        return jsonify(reply(
-            shop, customer,
-            f"✅ Appuntamento confermato!\n💈 *{sess['service']}*\n🕒 {sess['pending']}\nA presto 👋"
-        ))
-
-    # PROPOSTA
-    best = slots[0]
-    sess["pending"] = fmt(best)
-    save_session(shop, customer, sess)
-
-    return jsonify(reply(
-        shop, customer,
-        f"Purtroppo l’orario richiesto non è disponibile 😕\n"
-        f"Posso però offrirti:\n"
-        f"🕒 *{fmt(best)}*\n"
-        f"Va bene per te?"
-    ))
-
-def reply(shop, customer, text):
-    return {
-        "shop_number": shop,
+    reply = handle_message(shop, customer, msg)
+    return jsonify({
+        "shop": shop["name"],
+        "shop_number": shop_number,
         "customer": customer,
-        "bot_reply": text
-    }
+        "message_in": msg,
+        "bot_reply": reply
+    })
 
-# ============================================================
+@app.route("/")
+def home():
+    return "RispondiTu attivo ✅"
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
