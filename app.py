@@ -2,17 +2,11 @@ from __future__ import annotations
 
 import os, re, json, difflib, uuid
 import datetime as dt
-from typing import Dict, List, Optional, Tuple
-
+from typing import Dict, List, Optional, Tuple, Set
 from flask import Flask, request, jsonify
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # fallback se non disponibile
 
 # ============================================================
 # APP
@@ -22,14 +16,14 @@ app = Flask(__name__)
 # ============================================================
 # ENV
 # ============================================================
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "30"))
 
-SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "120"))  # più alto = meglio per WhatsApp
 MAX_LOOKAHEAD_DAYS = int(os.getenv("MAX_LOOKAHEAD_DAYS", "14"))
 DEFAULT_SLOT_MINUTES = int(os.getenv("DEFAULT_SLOT_MINUTES", "30"))
 
-# parole chiave blocco ferie/chiuso (anche se evento fosse "free")
+# parole chiave che bloccano sempre lo slot (anche se evento non-busy)
 BLOCK_KEYWORDS = {"chiuso", "ferie", "malattia", "off", "closed", "vacation", "sick"}
 
 # ============================================================
@@ -40,7 +34,7 @@ _calendar = None
 
 def creds():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON")
+        raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -66,14 +60,12 @@ def calendar():
 def norm_phone(p: str) -> str:
     return re.sub(r"\D+", "", p or "")
 
-def norm_text(v: str) -> str:
-    return (v or "").strip()
-
-def safe_lower(v: str) -> str:
-    return norm_text(v).lower()
+def now() -> dt.datetime:
+    # Se vuoi timezone fisso: imposta TZ=Europe/Rome su Railway
+    return dt.datetime.now()
 
 def parse_bool(v: str) -> bool:
-    return str(v).strip().lower() in {"true", "1", "yes", "y", "ok"}
+    return str(v).strip().lower() in {"true", "1", "yes", "y", "si", "sì"}
 
 def parse_int(v: str, default: int) -> int:
     try:
@@ -81,43 +73,28 @@ def parse_int(v: str, default: int) -> int:
     except Exception:
         return default
 
-def utc_now() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
+def norm_text(v: str) -> str:
+    return (v or "").strip()
 
-def shop_tz(shop: Dict) -> dt.tzinfo:
-    tz_name = shop.get("timezone") or shop.get("time_zone") or "Europe/Rome"
-    if ZoneInfo:
-        try:
-            return ZoneInfo(tz_name)
-        except Exception:
-            return dt.timezone(dt.timedelta(hours=1))
-    return dt.timezone(dt.timedelta(hours=1))
+def safe_lower(v: str) -> str:
+    return norm_text(v).lower()
 
-def local_now(shop: Dict) -> dt.datetime:
-    return utc_now().astimezone(shop_tz(shop))
+def _iso_time(t: dt.time) -> str:
+    return t.strftime("%H:%M")
 
-def to_rfc3339(d: dt.datetime) -> str:
-    # Google Calendar vuole timezone aware
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=dt.timezone.utc)
-    return d.isoformat()
+def _is_affirmative(t: str) -> bool:
+    low = safe_lower(t)
+    return low in {"ok", "va bene", "confermo", "si", "sì", "1"}
+
+def _is_second_choice(t: str) -> bool:
+    return safe_lower(t) == "2"
 
 # ============================================================
-# DATE / TIME PARSING
+# DATE / TIME PARSING (semplice)
 # ============================================================
-WEEKDAY_IT = {
-    "lun": 0, "lunedì": 0, "lunedi": 0,
-    "mar": 1, "martedì": 1, "martedi": 1,
-    "mer": 2, "mercoledì": 2, "mercoledi": 2,
-    "gio": 3, "giovedì": 3, "giovedi": 3,
-    "ven": 4, "venerdì": 4, "venerdi": 4,
-    "sab": 5, "sabato": 5,
-    "dom": 6, "domenica": 6,
-}
-
-def parse_date(text: str, shop: Dict) -> Optional[dt.date]:
+def parse_date(text: str) -> Optional[dt.date]:
     t = safe_lower(text)
-    today = local_now(shop).date()
+    today = dt.date.today()
 
     if "oggi" in t:
         return today
@@ -126,15 +103,7 @@ def parse_date(text: str, shop: Dict) -> Optional[dt.date]:
     if "dopodomani" in t:
         return today + dt.timedelta(days=2)
 
-    # "sabato", "lunedì", ecc.
-    for k, wd in WEEKDAY_IT.items():
-        if re.search(rf"\b{k}\b", t):
-            delta = (wd - today.weekday()) % 7
-            if delta == 0:
-                delta = 7
-            return today + dt.timedelta(days=delta)
-
-    # formato 12/01 o 12-01 o 12/01/2026
+    # formato 12/01 o 12-01
     m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", t)
     if m:
         d = int(m.group(1))
@@ -163,21 +132,9 @@ def parse_fascia(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
         return dt.time(9, 0), dt.time(12, 0)
     if "pomeriggio" in t:
         return dt.time(14, 0), dt.time(18, 0)
-    if "sera" in t or "tardo" in t:
+    if "tardo" in t or "sera" in t:
         return dt.time(17, 0), dt.time(21, 0)
     return None, None
-
-def parse_customer_name(text: str) -> Optional[str]:
-    # molto semplice: "sono Mario" / "mi chiamo Mario"
-    t = norm_text(text)
-    m = re.search(r"\b(sono|mi chiamo)\s+([A-Za-zÀ-ÖØ-öø-ÿ'\- ]{2,40})\b", t, re.IGNORECASE)
-    if m:
-        name = norm_text(m.group(2))
-        # taglia eventuali extra
-        name = re.split(r"[,.!?\n]", name)[0].strip()
-        if 2 <= len(name) <= 40:
-            return name
-    return None
 
 # ============================================================
 # FUZZY SERVICE MATCH
@@ -191,45 +148,10 @@ def fuzzy_service(text: str, services: List[Dict]) -> Optional[Dict]:
         for s in services:
             if safe_lower(s.get("name", "")) == target:
                 return s
-    # fallback: match substring
-    for s in services:
-        if safe_lower(s.get("name", "")) and safe_lower(s["name"]) in q:
-            return s
     return None
 
 # ============================================================
-# OPERATOR PREFERENCE / REJECTION
-# ============================================================
-def detect_operator_preference(text: str, operators: List[Dict]) -> Optional[str]:
-    t = safe_lower(text)
-    # se c'è "no X" non trattarlo come preferenza
-    if re.search(r"\b(no|non)\b", t):
-        return None
-
-    cleaned = re.sub(r"[^\w\sàèéìòù]", " ", t)
-    words = set(cleaned.split())
-
-    for op in operators:
-        oid = safe_lower(op.get("operator_id", ""))
-        oname = safe_lower(op.get("operator_name", ""))
-        if oid and oid in words:
-            return op["operator_id"]
-        if oname and oname in words:
-            return op["operator_id"]
-    return None
-
-def detect_operator_rejection(text: str, operators: List[Dict]) -> Optional[str]:
-    t = safe_lower(text)
-    for op in operators:
-        name = safe_lower(op.get("operator_name", "")) or safe_lower(op.get("operator_id", ""))
-        if not name:
-            continue
-        if re.search(rf"\b(no|non)\s+{re.escape(name)}\b", t):
-            return op["operator_id"]
-    return None
-
-# ============================================================
-# SHEETS HELPERS
+# SHEETS LOADERS
 # ============================================================
 def load_tab(tab: str) -> List[Dict]:
     res = sheets().spreadsheets().values().get(
@@ -242,63 +164,39 @@ def load_tab(tab: str) -> List[Dict]:
     headers = rows[0]
     out = []
     for r in rows[1:]:
-        out.append(dict(zip(headers, r + [""] * (len(headers) - len(r)))))
+        row = dict(zip(headers, r + [""] * (len(headers) - len(r))))
+        out.append(row)
     return out
 
-def sheet_append(tab: str, row: List[str]):
-    sheets().spreadsheets().values().append(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=f"{tab}!A:Z",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [row]}
-    ).execute()
-
-def sheet_update_row(tab: str, row_index_1based: int, headers: List[str], data: Dict[str, str]):
-    # costruisce una riga completa rispettando gli headers
-    values = [data.get(h, "") for h in headers]
-    rng = f"{tab}!A{row_index_1based}:{chr(ord('A') + len(headers)-1)}{row_index_1based}"
-    sheets().spreadsheets().values().update(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": [values]}
-    ).execute()
-
-def load_shop(shop_phone: str) -> Optional[Dict]:
-    shop_phone_n = norm_phone(shop_phone)
+def load_shop(phone: str) -> Optional[Dict]:
+    phone_n = norm_phone(phone)
     for s in load_tab("shops"):
-        # supporta entrambe le colonne: whatsapp_number / whatsapp_numb
-        ws = s.get("whatsapp_number") or s.get("whatsapp_numb") or ""
-        if norm_phone(ws) == shop_phone_n:
+        if norm_phone(s.get("whatsapp_number")) == phone_n:
             return s
     return None
 
 def load_services(shop_id: str) -> List[Dict]:
-    out = []
-    for s in load_tab("services"):
-        if s.get("shop_id") != shop_id:
-            continue
-        if not parse_bool(s.get("active", "TRUE")):
-            continue
-        out.append({
+    return [
+        {
             **s,
             "duration": parse_int(s.get("duration", "30"), 30),
-            "price": parse_int(s.get("price", "0"), 0),
-            "active": True,
-        })
-    return out
+            "active": parse_bool(s.get("active", "TRUE")),
+        }
+        for s in load_tab("services")
+        if s.get("shop_id") == shop_id and parse_bool(s.get("active", "TRUE"))
+    ]
 
 def load_hours(shop_id: str) -> Dict[int, List[Tuple[dt.time, dt.time]]]:
     out = {i: [] for i in range(7)}
     for r in load_tab("hours"):
-        if r.get("shop_id") != shop_id:
-            continue
-        try:
-            wd = int(r["weekday"])
-            out[wd].append((dt.time.fromisoformat(r["start"]), dt.time.fromisoformat(r["end"])))
-        except Exception:
-            pass
+        if r.get("shop_id") == shop_id:
+            try:
+                wd = int(r["weekday"])
+                out[wd].append(
+                    (dt.time.fromisoformat(r["start"]), dt.time.fromisoformat(r["end"]))
+                )
+            except Exception:
+                pass
     return out
 
 def load_operators(shop_id: str) -> List[Dict]:
@@ -310,188 +208,71 @@ def load_operators(shop_id: str) -> List[Dict]:
             continue
         ops.append({
             "shop_id": r.get("shop_id"),
-            "operator_id": r.get("operator_id") or "",
-            "operator_name": r.get("operator_name") or r.get("operator_id") or "",
-            "calendar_id": r.get("calendar_id") or "",
+            "operator_id": norm_text(r.get("operator_id")),
+            "operator_name": norm_text(r.get("operator_name")) or norm_text(r.get("operator_id")),
+            "calendar_id": norm_text(r.get("calendar_id")),
             "priority": parse_int(r.get("priority", ""), 9999),
-            "skills": r.get("skills", ""),
-            "gender": r.get("gender", ""),
         })
     ops.sort(key=lambda x: (x["priority"], safe_lower(x["operator_name"])))
     return ops
 
 # ============================================================
-# PERSISTENT SESSION (Sheets: tab sessions)
-# columns expected: shop_id | phone | state | data | updated_at
+# SESSION (MEMORIA BREVE)
 # ============================================================
-def session_key(shop_id: str, customer_phone: str) -> Tuple[str, str]:
-    return shop_id, norm_phone(customer_phone)
+SESSIONS: Dict[str, Dict] = {}
 
-def load_session_from_sheet(shop_id: str, customer_phone: str) -> Dict:
-    phone_n = norm_phone(customer_phone)
-    rows = sheets().spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range="sessions!A:Z"
-    ).execute().get("values", [])
-
-    if not rows or len(rows) < 2:
+def get_session(key: str) -> Dict:
+    s = SESSIONS.get(key)
+    if not s:
         return {}
+    if (now() - s["ts"]).total_seconds() / 60 > SESSION_TTL_MINUTES:
+        del SESSIONS[key]
+        return {}
+    return dict(s)
 
-    headers = rows[0]
-    idx_shop = headers.index("shop_id") if "shop_id" in headers else 0
-    idx_phone = headers.index("phone") if "phone" in headers else 1
-    idx_data = headers.index("data") if "data" in headers else 3
-    idx_updated = headers.index("updated_at") if "updated_at" in headers else 4
+def save_session(key: str, data: Dict):
+    SESSIONS[key] = {"ts": now(), **data}
 
-    for i in range(1, len(rows)):
-        r = rows[i] + [""] * (len(headers) - len(rows[i]))
-        if r[idx_shop] == shop_id and norm_phone(r[idx_phone]) == phone_n:
-            updated_at = r[idx_updated] or ""
-            if updated_at:
-                try:
-                    updated_dt = dt.datetime.fromisoformat(updated_at)
-                    # TTL
-                    if (utc_now() - updated_dt).total_seconds() / 60 > SESSION_TTL_MINUTES:
-                        return {}
-                except Exception:
-                    pass
-            payload = r[idx_data] or ""
-            if not payload:
-                return {}
-            try:
-                return json.loads(payload)
-            except Exception:
-                return {}
-    return {}
-
-def save_session_to_sheet(shop_id: str, customer_phone: str, state: str, sess: Dict):
-    phone_n = norm_phone(customer_phone)
-    rows = sheets().spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range="sessions!A:Z"
-    ).execute().get("values", [])
-
-    if not rows:
-        # se tab vuota, non gestiamo qui
-        return
-
-    headers = rows[0]
-    # cerchiamo riga esistente
-    row_index = None
-    for i in range(1, len(rows)):
-        r = rows[i] + [""] * (len(headers) - len(rows[i]))
-        d = dict(zip(headers, r))
-        if d.get("shop_id") == shop_id and norm_phone(d.get("phone", "")) == phone_n:
-            row_index = i + 1  # 1-based
-            break
-
-    payload = json.dumps(sess, ensure_ascii=False)
-    updated_at = utc_now().isoformat()
-
-    data_row = {
-        "shop_id": shop_id,
-        "phone": phone_n,
-        "state": state,
-        "data": payload,
-        "updated_at": updated_at,
-    }
-
-    if row_index is None:
-        # append nel giusto ordine colonne
-        row = [data_row.get(h, "") for h in headers]
-        sheet_append("sessions", row)
-    else:
-        sheet_update_row("sessions", row_index, headers, data_row)
-
-def clear_session_sheet(shop_id: str, customer_phone: str):
-    # per semplicità: sovrascrive con data vuota (lascia la riga)
-    phone_n = norm_phone(customer_phone)
-    rows = sheets().spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range="sessions!A:Z"
-    ).execute().get("values", [])
-    if not rows or len(rows) < 2:
-        return
-
-    headers = rows[0]
-    for i in range(1, len(rows)):
-        r = rows[i] + [""] * (len(headers) - len(rows[i]))
-        d = dict(zip(headers, r))
-        if d.get("shop_id") == shop_id and norm_phone(d.get("phone", "")) == phone_n:
-            row_index = i + 1
-            data_row = {
-                "shop_id": shop_id,
-                "phone": phone_n,
-                "state": "",
-                "data": "",
-                "updated_at": utc_now().isoformat(),
-            }
-            sheet_update_row("sessions", row_index, headers, data_row)
-            return
+def clear_session(key: str):
+    if key in SESSIONS:
+        del SESSIONS[key]
 
 # ============================================================
-# CUSTOMERS (Sheets: tab customers)
-# columns expected: shop_id | phone | last_service | total_visits | last_visit
+# OPERATOR PREFERENCES (con Marco / non Marco)
 # ============================================================
-def upsert_customer_after_booking(shop_id: str, customer_phone: str, service_name: str, when_local: dt.datetime):
-    phone_n = norm_phone(customer_phone)
-    rows = sheets().spreadsheets().values().get(
-        spreadsheetId=GOOGLE_SHEET_ID,
-        range="customers!A:Z"
-    ).execute().get("values", [])
+def operator_label(op: Dict) -> str:
+    return op.get("operator_name") or op.get("operator_id") or "Operatore"
 
-    if not rows:
-        return
+def _operator_tokens(op: Dict) -> List[str]:
+    toks = []
+    if op.get("operator_name"):
+        toks.append(safe_lower(op["operator_name"]))
+    if op.get("operator_id"):
+        toks.append(safe_lower(op["operator_id"]))
+    return list({t for t in toks if t})
 
-    headers = rows[0]
-    def hidx(name: str, default: int) -> int:
-        return headers.index(name) if name in headers else default
+def parse_operator_prefs(text: str, operators: List[Dict]) -> Tuple[Optional[str], Set[str]]:
+    t = " " + safe_lower(text) + " "
+    preferred: Optional[str] = None
+    excluded: Set[str] = set()
 
-    idx_shop = hidx("shop_id", 0)
-    idx_phone = hidx("phone", 1)
-    idx_last_service = hidx("last_service", 2)
-    idx_total = hidx("total_visits", 3)
-    idx_last_visit = hidx("last_visit", 4)
+    neg_markers = [" non ", " senza ", " no ", " evita ", " non voglio "]
 
-    row_index = None
-    existing = None
-    for i in range(1, len(rows)):
-        r = rows[i] + [""] * (len(headers) - len(rows[i]))
-        if r[idx_shop] == shop_id and norm_phone(r[idx_phone]) == phone_n:
-            row_index = i + 1
-            existing = r
-            break
+    for op in operators:
+        op_id = op.get("operator_id")
+        if not op_id:
+            continue
+        for tok in _operator_tokens(op):
+            for nm in neg_markers:
+                if nm + tok + " " in t or nm + tok + "." in t or nm + tok + "," in t:
+                    excluded.add(op_id)
+            if f" con {tok} " in t or f" da {tok} " in t or f" voglio {tok} " in t or f" preferisco {tok} " in t:
+                preferred = op_id
 
-    last_visit_str = when_local.strftime("%Y-%m-%d %H:%M")
+    if preferred and preferred in excluded:
+        preferred = None
 
-    if row_index is None:
-        data_row = {h: "" for h in headers}
-        data_row[headers[idx_shop]] = shop_id
-        data_row[headers[idx_phone]] = phone_n
-        if idx_last_service < len(headers):
-            data_row[headers[idx_last_service]] = service_name
-        if idx_total < len(headers):
-            data_row[headers[idx_total]] = "1"
-        if idx_last_visit < len(headers):
-            data_row[headers[idx_last_visit]] = last_visit_str
-        sheet_append("customers", [data_row.get(h, "") for h in headers])
-    else:
-        total = 0
-        try:
-            total = int(existing[idx_total] or "0")
-        except Exception:
-            total = 0
-        total += 1
-
-        data_row = dict(zip(headers, existing + [""] * (len(headers) - len(existing))))
-        if idx_last_service < len(headers):
-            data_row[headers[idx_last_service]] = service_name
-        if idx_total < len(headers):
-            data_row[headers[idx_total]] = str(total)
-        if idx_last_visit < len(headers):
-            data_row[headers[idx_last_visit]] = last_visit_str
-
-        sheet_update_row("customers", row_index, headers, data_row)
+    return preferred, excluded
 
 # ============================================================
 # CALENDAR HELPERS
@@ -500,63 +281,42 @@ def _has_block_keyword(summary: str) -> bool:
     s = safe_lower(summary)
     return any(k in s for k in BLOCK_KEYWORDS)
 
-def event_to_datetime_range(ev: Dict, tz: dt.tzinfo) -> Tuple[dt.datetime, dt.datetime]:
-    """
-    Normalizza eventi calendar:
-    - se all-day: start/end hanno "date"
-    - altrimenti: "dateTime"
-    """
-    start = ev.get("start", {})
-    end = ev.get("end", {})
-
-    if "dateTime" in start:
-        sdt = dt.datetime.fromisoformat(start["dateTime"])
-    else:
-        # all-day start date: 2026-01-07 -> 00:00
-        sdt = dt.datetime.fromisoformat(start.get("date")).replace(hour=0, minute=0, second=0)
-
-    if "dateTime" in end:
-        edt = dt.datetime.fromisoformat(end["dateTime"])
-    else:
-        # all-day end date è esclusivo: metti 00:00 di quel giorno
-        edt = dt.datetime.fromisoformat(end.get("date")).replace(hour=0, minute=0, second=0)
-
-    if sdt.tzinfo is None:
-        sdt = sdt.replace(tzinfo=tz)
-    if edt.tzinfo is None:
-        edt = edt.replace(tzinfo=tz)
-
-    return sdt, edt
-
-def slot_is_free(calendar_id: str, start: dt.datetime, end: dt.datetime, tz: dt.tzinfo) -> bool:
-    """
-    Libero se NON ci sono eventi che bloccano.
-    Bloccante = transparency != 'transparent' (busy) oppure keyword nel summary.
-    """
+def slot_is_free(calendar_id: str, start: dt.datetime, end: dt.datetime) -> bool:
     evs = calendar().events().list(
         calendarId=calendar_id,
-        timeMin=to_rfc3339(start),
-        timeMax=to_rfc3339(end),
+        timeMin=start.isoformat(),
+        timeMax=end.isoformat(),
         singleEvents=True,
         orderBy="startTime",
         maxResults=50
     ).execute().get("items", [])
 
     for ev in evs:
-        summary = ev.get("summary", "") or ""
-        transparency = ev.get("transparency", "")  # 'transparent' se non blocca
-
+        summary = ev.get("summary", "")
+        transparency = ev.get("transparency", "")
         if _has_block_keyword(summary):
             return False
-
-        # se non è esplicitamente "transparent", lo consideriamo busy
         if transparency != "transparent":
-            # in più, controlla overlap robusto (soprattutto per all-day)
-            sdt, edt = event_to_datetime_range(ev, tz)
-            if sdt < end and edt > start:
-                return False
-
+            return False
     return True
+
+def find_event_by_booking_key(calendar_id: str, start: dt.datetime, end: dt.datetime, booking_key: str) -> Optional[Dict]:
+    # cerchiamo nella finestra dello slot (più un buffer piccolo)
+    buf_start = (start - dt.timedelta(minutes=5)).isoformat()
+    buf_end = (end + dt.timedelta(minutes=5)).isoformat()
+    evs = calendar().events().list(
+        calendarId=calendar_id,
+        timeMin=buf_start,
+        timeMax=buf_end,
+        singleEvents=True,
+        orderBy="startTime",
+        maxResults=50
+    ).execute().get("items", [])
+    for ev in evs:
+        ep = (ev.get("extendedProperties") or {}).get("private") or {}
+        if ep.get("booking_key") == booking_key:
+            return ev
+    return None
 
 def create_booking_event(
     calendar_id: str,
@@ -568,8 +328,14 @@ def create_booking_event(
     shop_name: str,
     operator_name: str,
     booking_id: str,
+    booking_key: str,
     notes: str = ""
 ) -> str:
+    # idempotenza: se già esiste evento con booking_key, non duplicare
+    existing = find_event_by_booking_key(calendar_id, start, end, booking_key)
+    if existing:
+        return existing.get("id", "")
+
     summary = f"{service_name} – {customer_name}".strip(" –")
 
     description_lines = [
@@ -582,22 +348,20 @@ def create_booking_event(
     ]
     if notes:
         description_lines.append(f"Note: {notes}")
-    description_lines += [
-        "",
-        f"Booking ID: {booking_id}",
-    ]
+    description_lines += ["", f"Booking ID: {booking_id}"]
 
     body = {
         "summary": summary,
         "description": "\n".join(description_lines),
-        "start": {"dateTime": to_rfc3339(start)},
-        "end": {"dateTime": to_rfc3339(end)},
-        "transparency": "opaque",     # occupato
-        "visibility": "private",      # lo staff con permessi vede i dettagli
+        "start": {"dateTime": start.isoformat()},
+        "end": {"dateTime": end.isoformat()},
+        "transparency": "opaque",
+        "visibility": "private",
         "extendedProperties": {
             "private": {
                 "booking_id": booking_id,
-                "customer_phone": norm_phone(customer_phone),
+                "booking_key": booking_key,
+                "customer_phone": customer_phone,
                 "customer_name": customer_name,
                 "service": service_name,
                 "shop": shop_name,
@@ -610,185 +374,42 @@ def create_booking_event(
     return ev.get("id", "")
 
 # ============================================================
-# CORE BOT LOGIC (multi-operatore + preferenze)
+# SEARCH (ritorna fino a N opzioni)
 # ============================================================
-def handle(shop: Dict, customer_phone: str, text: str) -> str:
-    shop_id = shop.get("shop_id", "")
-    tz = shop_tz(shop)
-    customer_phone_n = norm_phone(customer_phone)
+def find_best_slots(
+    hours: Dict[int, List[Tuple[dt.time, dt.time]]],
+    operators: List[Dict],
+    base_date: dt.date,
+    dur_min: int,
+    slot_minutes: int,
+    preferred_time: Optional[dt.time],
+    after: Optional[dt.time],
+    before: Optional[dt.time],
+    preferred_operator_id: Optional[str],
+    excluded_operator_ids: Set[str],
+    limit: int = 2,
+) -> List[Tuple[dt.datetime, Dict]]:
+    ops_by_id = {op.get("operator_id"): op for op in operators if op.get("operator_id")}
 
-    # carica sessione persistente
-    sess = load_session_from_sheet(shop_id, customer_phone_n) or {}
-    state = sess.get("state", "")
-
-    services = load_services(shop_id)
-    hours = load_hours(shop_id)
-    operators = load_operators(shop_id)
-
-    slot_minutes = parse_int(shop.get("slot_minutes", ""), DEFAULT_SLOT_MINUTES)
-
-    low = safe_lower(text)
-
-    # 0) reset rapido
-    if low in {"reset", "annulla", "cancella"}:
-        clear_session_sheet(shop_id, customer_phone_n)
-        return "Ok 👍 Ho azzerato la richiesta. Dimmi pure che servizio ti serve."
-
-    # 1) greeting
-    if low in {"ciao", "salve", "buongiorno", "buonasera"} and not sess:
-        return (
-            f"Ciao! 👋 Sono l’assistente di *{shop.get('name','il salone')}*.\n"
-            "Dimmi pure che servizio ti serve 😊"
-        )
-
-    # 2) salva nome cliente se lo dice
-    nm = parse_customer_name(text)
-    if nm:
-        sess["customer_name"] = nm
-
-    # 3) se sta confermando slot proposto
-    if state == "await_ok" and sess.get("slot") and sess.get("operator"):
-        if low in {"ok", "va bene", "confermo", "si", "sì"}:
-            service = sess["service"]
-            start = dt.datetime.fromisoformat(sess["slot"])
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=tz)
-
-            dur = int(service.get("duration", 30))
-            end = start + dt.timedelta(minutes=dur)
-
-            op = sess["operator"]
-            booking_id = sess.get("booking_id") or uuid.uuid4().hex[:10]
-            customer_name = sess.get("customer_name") or "Cliente"
-
-            create_booking_event(
-                calendar_id=op["calendar_id"],
-                start=start,
-                end=end,
-                service_name=service["name"],
-                customer_name=customer_name,
-                customer_phone=customer_phone_n,
-                shop_name=shop.get("name", ""),
-                operator_name=op.get("operator_name", ""),
-                booking_id=booking_id,
-                notes=sess.get("notes", "")
-            )
-
-            # aggiorna customer stats
-            upsert_customer_after_booking(shop_id, customer_phone_n, service["name"], start)
-
-            # pulisci sessione
-            clear_session_sheet(shop_id, customer_phone_n)
-
-            return (
-                "Perfetto! ✅ Appuntamento confermato.\n\n"
-                f"💈 *{service['name']}*\n"
-                f"👤 Operatore: *{op.get('operator_name','') }*\n"
-                f"🕒 {start.strftime('%a %d/%m %H:%M')}\n"
-                f"🔖 Booking ID: {booking_id}\n\n"
-                "A presto 😊"
-            )
-
-        if low in {"no", "non va", "cambia", "altro"}:
-            # proponi alternative (passa a searching)
-            sess["state"] = "searching"
-            sess.pop("slot", None)
-            sess.pop("operator", None)
-            save_session_to_sheet(shop_id, customer_phone_n, "searching", sess)
-            state = "searching"
-
-    # 4) SERVIZIO
-    if "service" not in sess:
-        service = fuzzy_service(text, services)
-        if service:
-            sess["service"] = service
-        else:
-            lst = "\n".join(f"• {s['name']}" for s in services) if services else "• (nessun servizio configurato)"
-            save_session_to_sheet(shop_id, customer_phone_n, "need_service", sess)
-            return "Dimmi solo che servizio ti serve:\n" + lst
-
-    # 5) DATA / ORARIO
-    d = parse_date(text, shop)
-    t = parse_time(text)
-    a, b = parse_fascia(text)
-
-    if d:
-        sess["date"] = d.isoformat()
-    if t:
-        sess["time"] = t.strftime("%H:%M")
-        # se mette un orario preciso, togli fascia
-        sess.pop("after", None); sess.pop("before", None)
-    if a and b and "time" not in sess:
-        sess["after"] = a.strftime("%H:%M")
-        sess["before"] = b.strftime("%H:%M")
-
-    # 6) preferenza / rifiuto operatore
-    if operators:
-        pref = detect_operator_preference(text, operators)
-        rej = detect_operator_rejection(text, operators)
-
-        if pref:
-            sess["preferred_operator_id"] = pref
-            # se preferisco uno, reset esclusioni per evitare conflitti
-            sess.pop("excluded_operator_ids", None)
-
-        if rej:
-            sess.setdefault("excluded_operator_ids", [])
-            if rej not in sess["excluded_operator_ids"]:
-                sess["excluded_operator_ids"].append(rej)
-            # se stava preferendo proprio quello escluso, toglilo
-            if sess.get("preferred_operator_id") == rej:
-                sess.pop("preferred_operator_id", None)
-
-    # salva stato parziale
-    save_session_to_sheet(shop_id, customer_phone_n, "collecting", sess)
-
-    if "date" not in sess:
-        return (
-            "Perfetto 👍\n"
-            "Quando preferisci venire?\n"
-            "(es. *domani*, *sabato*, *12/01*)"
-        )
-
-    if "time" not in sess and "after" not in sess:
-        return "Preferisci *mattina*, *pomeriggio* o *sera*? 😊"
-
-    if not operators:
-        return (
-            "Mi manca la configurazione degli operatori 😕\n"
-            "Nel foglio Google, tab *operators*, aggiungi almeno un operatore con calendar_id."
-        )
-
-    # 7) Filtra operatori (preferenza / esclusioni)
-    filtered_ops = operators[:]
-
-    if sess.get("preferred_operator_id"):
-        filtered_ops = [o for o in filtered_ops if o.get("operator_id") == sess["preferred_operator_id"]]
-
-    if not sess.get("preferred_operator_id"):
-        excluded = set(sess.get("excluded_operator_ids", []))
-        if excluded:
-            filtered_ops = [o for o in filtered_ops if o.get("operator_id") not in excluded]
-
-    # se ha escluso tutti, resetta esclusioni
-    if not filtered_ops:
-        sess.pop("excluded_operator_ids", None)
-        filtered_ops = operators[:]
-
-    # 8) CERCA SLOT MIGLIORE
-    service = sess["service"]
-    dur = int(service.get("duration", 30))
-    base = dt.date.fromisoformat(sess["date"])
-
-    preferred_time = dt.time.fromisoformat(sess["time"]) if sess.get("time") else None
-    after = dt.time.fromisoformat(sess["after"]) if sess.get("after") else None
-    before = dt.time.fromisoformat(sess["before"]) if sess.get("before") else None
+    def op_order() -> List[Dict]:
+        ordered = []
+        if preferred_operator_id and preferred_operator_id in ops_by_id and preferred_operator_id not in excluded_operator_ids:
+            ordered.append(ops_by_id[preferred_operator_id])
+        for op in operators:
+            oid = op.get("operator_id")
+            if not oid or oid in excluded_operator_ids:
+                continue
+            if preferred_operator_id and oid == preferred_operator_id:
+                continue
+            ordered.append(op)
+        return ordered
 
     def candidate_slots_for_day(day: dt.date) -> List[dt.datetime]:
         slots: List[dt.datetime] = []
         for st, en in hours.get(day.weekday(), []):
             sst = st
             een = en
+
             if after and sst < after:
                 sst = after
             if before and een > before:
@@ -797,98 +418,249 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
                 continue
 
             if preferred_time:
-                cand = dt.datetime.combine(day, preferred_time).replace(tzinfo=tz)
-                if cand.time() >= sst and (cand + dt.timedelta(minutes=dur)).time() <= een:
+                cand = dt.datetime.combine(day, preferred_time)
+                if cand.time() >= sst and (cand + dt.timedelta(minutes=dur_min)).time() <= een:
                     return [cand]
                 return []
 
-            cur = dt.datetime.combine(day, sst).replace(tzinfo=tz)
-            limit = dt.datetime.combine(day, een).replace(tzinfo=tz)
-            while cur + dt.timedelta(minutes=dur) <= limit:
+            cur = dt.datetime.combine(day, sst)
+            limit_dt = dt.datetime.combine(day, een)
+            while cur + dt.timedelta(minutes=dur_min) <= limit_dt:
                 slots.append(cur)
                 cur += dt.timedelta(minutes=slot_minutes)
         return slots
 
-    found: Optional[Tuple[dt.datetime, Dict]] = None
+    ordered_ops = op_order()
+    results: List[Tuple[dt.datetime, Dict]] = []
 
     for day_offset in range(MAX_LOOKAHEAD_DAYS):
-        day = base + dt.timedelta(days=day_offset)
+        day = base_date + dt.timedelta(days=day_offset)
         day_slots = candidate_slots_for_day(day)
         if not day_slots:
             continue
 
         for slot_dt in day_slots:
-            end_dt = slot_dt + dt.timedelta(minutes=dur)
-
-            # se non ha preferenza: prova operatori in ordine priority
-            for op in filtered_ops:
+            end_dt = slot_dt + dt.timedelta(minutes=dur_min)
+            for op in ordered_ops:
                 cal_id = op.get("calendar_id")
                 if not cal_id:
                     continue
-                if slot_is_free(cal_id, slot_dt, end_dt, tz):
-                    found = (slot_dt, op)
+                if slot_is_free(cal_id, slot_dt, end_dt):
+                    results.append((slot_dt, op))
+                    if len(results) >= limit:
+                        return results
                     break
-            if found:
-                break
-        if found:
-            break
 
-    if not found:
-        # se preferiva uno specifico, proponi alternative (se esistono)
-        if sess.get("preferred_operator_id"):
-            preferred_name = ""
-            for o in operators:
-                if o.get("operator_id") == sess["preferred_operator_id"]:
-                    preferred_name = o.get("operator_name", "")
-                    break
-            sess.pop("preferred_operator_id", None)
-            save_session_to_sheet(shop_id, customer_phone_n, "collecting", sess)
-            return (
-                f"{preferred_name or 'L’operatore scelto'} non è disponibile in quella fascia 😕\n"
-                "Vuoi che ti proponga il primo slot libero con un altro operatore?"
+    return results
+
+# ============================================================
+# CORE BOT LOGIC v3.3
+# ============================================================
+def handle(shop: Dict, customer_phone: str, text: str) -> str:
+    shop_id = shop["shop_id"]
+    key = f"{shop_id}:{norm_phone(customer_phone)}"
+    sess = get_session(key)
+
+    services = load_services(shop_id)
+    hours = load_hours(shop_id)
+    operators = load_operators(shop_id)
+
+    slot_minutes = parse_int(shop.get("slot_minutes", ""), DEFAULT_SLOT_MINUTES)
+    low = safe_lower(text)
+
+    # reset
+    if low in {"reset", "annulla", "cancella"}:
+        clear_session(key)
+        return "Ok 👍 Ho azzerato la richiesta. Dimmi che servizio ti serve."
+
+    # greeting
+    if low in {"ciao", "salve", "buongiorno", "buonasera"} and not sess:
+        return (
+            f"Ciao! 👋 Sono l’assistente di *{shop.get('name','il salone')}*.\n"
+            "Dimmi pure che servizio ti serve 😊"
+        )
+
+    # preferenze operatore (sempre)
+    if operators:
+        pref, excl = parse_operator_prefs(text, operators)
+        if pref:
+            sess["preferred_operator_id"] = pref
+        if excl:
+            cur_excl = set(sess.get("excluded_operator_ids") or [])
+            cur_excl |= set(excl)
+            sess["excluded_operator_ids"] = list(cur_excl)
+
+    # ========================================================
+    # STATO: proposta opzioni (1/2/OK)
+    # ========================================================
+    if sess.get("state") == "await_choice" and sess.get("options"):
+        if _is_affirmative(text) or _is_second_choice(text):
+            idx = 0 if _is_affirmative(text) else 1
+            if idx >= len(sess["options"]):
+                idx = 0
+
+            opt = sess["options"][idx]
+            start = dt.datetime.fromisoformat(opt["slot"])
+            op = opt["operator"]
+            service = sess["service"]
+            dur = int(service.get("duration", 30))
+            end = start + dt.timedelta(minutes=dur)
+
+            booking_id = sess.get("booking_id") or uuid.uuid4().hex[:10]
+            customer_name = sess.get("customer_name") or "Cliente"
+
+            # booking_key deterministica: stesso cliente+servizio+slot+shop -> stessa chiave
+            bk_raw = f"{shop_id}|{norm_phone(customer_phone)}|{service.get('name','')}|{start.isoformat()}"
+            booking_key = uuid.uuid5(uuid.NAMESPACE_URL, bk_raw).hex
+
+            create_booking_event(
+                calendar_id=op["calendar_id"],
+                start=start,
+                end=end,
+                service_name=service["name"],
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                shop_name=shop.get("name", ""),
+                operator_name=op.get("operator_name", ""),
+                booking_id=booking_id,
+                booking_key=booking_key,
+                notes=sess.get("notes", "")
             )
 
+            clear_session(key)
+            return (
+                "Perfetto! ✅ Appuntamento confermato.\n\n"
+                f"💈 *{service['name']}*\n"
+                f"👤 Con: *{operator_label(op)}*\n"
+                f"🕒 {start.strftime('%a %d/%m %H:%M')}\n"
+                f"🔖 Booking ID: {booking_id}\n\n"
+                "A presto 😊"
+            )
+
+        # se rifiuta o dice "non Marco", escludi l'opzione 1 e riprova
+        if ("non " in low) or ("senza " in low) or low in {"no", "cambia", "altro"}:
+            # escludi operatore della prima opzione proposta
+            first_op = sess["options"][0]["operator"]
+            oid = first_op.get("operator_id")
+            if oid:
+                cur_excl = set(sess.get("excluded_operator_ids") or [])
+                cur_excl.add(oid)
+                sess["excluded_operator_ids"] = list(cur_excl)
+
+            sess["state"] = "searching"
+            sess.pop("options", None)
+            save_session(key, sess)
+            # continua sotto per ricercare nuove opzioni
+
+    # ========================================================
+    # SERVIZIO
+    # ========================================================
+    if "service" not in sess:
+        service = fuzzy_service(text, services)
+        if service:
+            sess["service"] = service
+            save_session(key, sess)
+        else:
+            lst = "\n".join(f"• {s['name']}" for s in services) if services else "• (nessun servizio configurato)"
+            return "Dimmi solo che servizio ti serve:\n" + lst
+
+    # ========================================================
+    # DATA / ORARIO
+    # ========================================================
+    d = parse_date(text)
+    t = parse_time(text)
+    a, b = parse_fascia(text)
+
+    if d:
+        sess["date"] = d.isoformat()
+    if t:
+        sess["time"] = _iso_time(t)
+    if a and b:
+        sess["after"] = _iso_time(a)
+        sess["before"] = _iso_time(b)
+
+    save_session(key, sess)
+
+    if "date" not in sess:
+        return "Perfetto 👍 Quando preferisci venire? (es. *domani* oppure *12/01*)"
+
+    if "time" not in sess and "after" not in sess:
+        return "Preferisci *mattina*, *pomeriggio* o *sera*? 😊"
+
+    # operatori
+    if not operators:
+        return (
+            "Mi manca la configurazione degli operatori 😕\n"
+            "Nel foglio Google, tab *operators*, aggiungi almeno un operatore con calendar_id."
+        )
+
+    # ========================================================
+    # CERCA 2 OPZIONI
+    # ========================================================
+    service = sess["service"]
+    dur = int(service.get("duration", 30))
+    base = dt.date.fromisoformat(sess["date"])
+
+    preferred_time = dt.time.fromisoformat(sess["time"]) if sess.get("time") else None
+    after = dt.time.fromisoformat(sess["after"]) if sess.get("after") else None
+    before = dt.time.fromisoformat(sess["before"]) if sess.get("before") else None
+
+    preferred_operator_id = sess.get("preferred_operator_id")
+    excluded_operator_ids = set(sess.get("excluded_operator_ids") or [])
+
+    options = find_best_slots(
+        hours=hours,
+        operators=operators,
+        base_date=base,
+        dur_min=dur,
+        slot_minutes=slot_minutes,
+        preferred_time=preferred_time,
+        after=after,
+        before=before,
+        preferred_operator_id=preferred_operator_id,
+        excluded_operator_ids=excluded_operator_ids,
+        limit=2
+    )
+
+    if not options:
         return (
             "Al momento non vedo disponibilità nei prossimi giorni 😕\n"
             "Vuoi provare un altro giorno o un’altra fascia?"
         )
 
-    best_dt, best_op = found
-    booking_id = uuid.uuid4().hex[:10]
+    # prepara opzioni per sessione
+    packed = []
+    for slot_dt, op in options:
+        packed.append({
+            "slot": slot_dt.isoformat(),
+            "operator": op
+        })
 
-    sess["slot"] = best_dt.isoformat()
-    sess["operator"] = best_op
-    sess["booking_id"] = booking_id
-    sess["state"] = "await_ok"
-    save_session_to_sheet(shop_id, customer_phone_n, "await_ok", sess)
+    sess["options"] = packed
+    sess["state"] = "await_choice"
+    sess["booking_id"] = sess.get("booking_id") or uuid.uuid4().hex[:10]
+    save_session(key, sess)
 
-    # messaggio diverso se preferiva/ha escluso qualcuno (più umano)
-    extra = ""
-    if sess.get("preferred_operator_id"):
-        extra = f"Con *{best_op.get('operator_name','')}* 👍"
-    elif sess.get("excluded_operator_ids"):
-        extra = f"Ok, evito *{', '.join(sess['excluded_operator_ids'])}* 👍"
+    # risposta: 1 o 2, con operatore
+    msg = "Ti propongo questi orari 👇\n\n"
+    slot1, op1 = options[0]
+    msg += f"1) 🕒 {slot1.strftime('%a %d/%m %H:%M')} — con *{operator_label(op1)}*\n"
+    if len(options) > 1:
+        slot2, op2 = options[1]
+        msg += f"2) 🕒 {slot2.strftime('%a %d/%m %H:%M')} — con *{operator_label(op2)}*\n"
 
-    return (
-        "Ti propongo questo orario 👇\n\n"
-        f"💈 *{service['name']}*\n"
-        f"👤 Operatore: *{best_op.get('operator_name','') }*\n"
-        f"🕒 {best_dt.strftime('%a %d/%m %H:%M')}\n"
-        f"{extra}\n\n"
-        "Va bene per te? Rispondi *OK* oppure dimmi un’altra preferenza 😊"
-    )
+    msg += "\nRispondi *1* o *2* (oppure *OK* per confermare la 1).\n"
+    msg += "Se vuoi un operatore specifico scrivi: *con Marco* oppure *non Marco* 😊"
+    return msg
 
 # ============================================================
 # ROUTE (test)
 # ============================================================
 @app.route("/test")
 def test():
-    phone = request.args.get("phone")          # numero del salone (shops.whatsapp_number / whatsapp_numb)
+    phone = request.args.get("phone")          # whatsapp_number del salone
     customer = request.args.get("customer")    # numero cliente
     msg = request.args.get("msg", "")
-
-    if not phone or not customer:
-        return jsonify({"error": "Missing phone or customer"}), 400
 
     shop = load_shop(phone)
     if not shop:
@@ -902,10 +674,6 @@ def test():
         "message_in": msg,
         "bot_reply": reply
     })
-
-@app.route("/health")
-def health():
-    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
