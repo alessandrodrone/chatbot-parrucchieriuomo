@@ -10,7 +10,6 @@ from flask import Flask, request, jsonify
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-
 # ============================================================
 # APP
 # ============================================================
@@ -19,8 +18,8 @@ app = Flask(__name__)
 # ============================================================
 # ENV - GOOGLE
 # ============================================================
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 
 # ============================================================
 # ENV - META WHATSAPP CLOUD
@@ -28,7 +27,7 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
 META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "")  # usato per inviare
-META_APP_SECRET = os.getenv("META_APP_SECRET", "")  # per verificare firma (consigliato)
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")            # firma webhook (opzionale ma consigliata)
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v20.0")
 
 # ============================================================
@@ -37,10 +36,7 @@ GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v20.0")
 SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "30"))
 MAX_LOOKAHEAD_DAYS = int(os.getenv("MAX_LOOKAHEAD_DAYS", "14"))
 DEFAULT_SLOT_MINUTES = int(os.getenv("DEFAULT_SLOT_MINUTES", "30"))
-
-# parole chiave che bloccano sempre lo slot (anche se evento non-busy)
 BLOCK_KEYWORDS = {"chiuso", "ferie", "malattia", "off", "closed", "vacation", "sick"}
-
 
 # ============================================================
 # GOOGLE CLIENTS
@@ -51,6 +47,8 @@ _calendar = None
 def creds():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
+    if not GOOGLE_SHEET_ID:
+        raise RuntimeError("Missing GOOGLE_SHEET_ID env var")
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -70,7 +68,6 @@ def calendar():
         _calendar = build("calendar", "v3", credentials=creds(), cache_discovery=False)
     return _calendar
 
-
 # ============================================================
 # UTILS
 # ============================================================
@@ -78,7 +75,6 @@ def norm_phone(p: str) -> str:
     return re.sub(r"\D+", "", p or "")
 
 def now() -> dt.datetime:
-    # Railway: imposta TZ=Europe/Rome
     return dt.datetime.now()
 
 def parse_bool(v: str) -> bool:
@@ -106,7 +102,6 @@ def _is_affirmative(t: str) -> bool:
 def _is_second_choice(t: str) -> bool:
     return safe_lower(t) == "2"
 
-
 # ============================================================
 # DATE / TIME PARSING (semplice)
 # ============================================================
@@ -121,7 +116,6 @@ def parse_date(text: str) -> Optional[dt.date]:
     if "dopodomani" in t:
         return today + dt.timedelta(days=2)
 
-    # formato 12/01 o 12-01
     m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", t)
     if m:
         d = int(m.group(1))
@@ -134,7 +128,6 @@ def parse_date(text: str) -> Optional[dt.date]:
             return dt.date(year, mo, d)
         except Exception:
             return None
-
     return None
 
 def parse_time(text: str) -> Optional[dt.time]:
@@ -154,7 +147,6 @@ def parse_fascia(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
         return dt.time(17, 0), dt.time(21, 0)
     return None, None
 
-
 # ============================================================
 # FUZZY SERVICE MATCH
 # ============================================================
@@ -168,7 +160,6 @@ def fuzzy_service(text: str, services: List[Dict]) -> Optional[Dict]:
             if safe_lower(s.get("name", "")) == target:
                 return s
     return None
-
 
 # ============================================================
 # SHEETS LOADERS
@@ -189,7 +180,6 @@ def load_tab(tab: str) -> List[Dict]:
     return out
 
 def load_shop_by_display_number(display_phone_number: str) -> Optional[Dict]:
-    # dal webhook arriva +39 .... -> normalizziamo e confrontiamo con shops.whatsapp_number
     phone_n = norm_phone(display_phone_number)
     for s in load_tab("shops"):
         if norm_phone(s.get("whatsapp_number")) == phone_n:
@@ -237,10 +227,8 @@ def load_operators(shop_id: str) -> List[Dict]:
     ops.sort(key=lambda x: (x["priority"], safe_lower(x["operator_name"])))
     return ops
 
-
 # ============================================================
 # SESSION (memoria breve) - in-memory
-# NOTA: per vendibile -> spostare su Postgres (consigliato)
 # ============================================================
 SESSIONS: Dict[str, Dict] = {}
 
@@ -259,7 +247,6 @@ def save_session(key: str, data: Dict):
 def clear_session(key: str):
     if key in SESSIONS:
         del SESSIONS[key]
-
 
 # ============================================================
 # DEDUP message ids (anti doppia risposta)
@@ -281,7 +268,6 @@ def seen_message(message_id: str) -> bool:
     PROCESSED_MSG_IDS[message_id] = now()
     return False
 
-
 # ============================================================
 # OPERATOR PREFERENCES
 # ============================================================
@@ -300,7 +286,6 @@ def parse_operator_prefs(text: str, operators: List[Dict]) -> Tuple[Optional[str
     t = " " + safe_lower(text) + " "
     preferred: Optional[str] = None
     excluded: Set[str] = set()
-
     neg_markers = [" non ", " senza ", " no ", " evita ", " non voglio "]
 
     for op in operators:
@@ -316,9 +301,7 @@ def parse_operator_prefs(text: str, operators: List[Dict]) -> Tuple[Optional[str
 
     if preferred and preferred in excluded:
         preferred = None
-
     return preferred, excluded
-
 
 # ============================================================
 # CALENDAR HELPERS
@@ -383,7 +366,7 @@ def create_booking_event(
     summary = f"{service_name} – {customer_name}".strip(" –")
 
     description_lines = [
-        f"Salone: {shop_name}",
+        f"Attività: {shop_name}",
         f"Operatore: {operator_name}",
         "",
         f"Cliente: {customer_name}",
@@ -416,7 +399,6 @@ def create_booking_event(
 
     ev = calendar().events().insert(calendarId=calendar_id, body=body).execute()
     return ev.get("id", "")
-
 
 # ============================================================
 # SEARCH (ritorna fino a N opzioni)
@@ -498,7 +480,6 @@ def find_best_slots(
 
     return results
 
-
 # ============================================================
 # CORE BOT LOGIC
 # ============================================================
@@ -514,19 +495,16 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
     slot_minutes = parse_int(shop.get("slot_minutes", ""), DEFAULT_SLOT_MINUTES)
     low = safe_lower(text)
 
-    # reset
     if low in {"reset", "annulla", "cancella"}:
         clear_session(key)
         return "Ok 👍 Ho azzerato la richiesta. Dimmi che servizio ti serve."
 
-    # greeting
     if low in {"ciao", "salve", "buongiorno", "buonasera"} and not sess:
         return (
-            f"Ciao! 👋 Sono l’assistente di *{shop.get('name','il salone')}*.\n"
+            f"Ciao! 👋 Sono l’assistente di *{shop.get('name','l’attività')}*.\n"
             "Dimmi pure che servizio ti serve 😊"
         )
 
-    # preferenze operatore (sempre)
     if operators:
         pref, excl = parse_operator_prefs(text, operators)
         if pref:
@@ -536,9 +514,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             cur_excl |= set(excl)
             sess["excluded_operator_ids"] = list(cur_excl)
 
-    # ========================================================
-    # STATO: proposta opzioni (1/2/OK)
-    # ========================================================
+    # Stato: scelta opzioni
     if sess.get("state") == "await_choice" and sess.get("options"):
         if _is_affirmative(text) or _is_second_choice(text):
             idx = 0 if _is_affirmative(text) else 1
@@ -575,7 +551,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             clear_session(key)
             return (
                 "Perfetto! ✅ Appuntamento confermato.\n\n"
-                f"💈 *{service['name']}*\n"
+                f"🔧 *{service['name']}*\n"
                 f"👤 Con: *{operator_label(op)}*\n"
                 f"🕒 {start.strftime('%a %d/%m %H:%M')}\n"
                 f"🔖 Booking ID: {booking_id}\n\n"
@@ -594,9 +570,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             sess.pop("options", None)
             save_session(key, sess)
 
-    # ========================================================
-    # SERVIZIO
-    # ========================================================
+    # servizio
     if "service" not in sess:
         service = fuzzy_service(text, services)
         if service:
@@ -606,9 +580,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             lst = "\n".join(f"• {s['name']}" for s in services) if services else "• (nessun servizio configurato)"
             return "Dimmi solo che servizio ti serve:\n" + lst
 
-    # ========================================================
-    # DATA / ORARIO
-    # ========================================================
+    # data/orario
     d = parse_date(text)
     t = parse_time(text)
     a, b = parse_fascia(text)
@@ -624,7 +596,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
     save_session(key, sess)
 
     if "date" not in sess:
-        return "Perfetto 👍 Quando preferisci venire? (es. *domani* oppure *12/01*)"
+        return "Perfetto 👍 Quando preferisci? (es. *domani* oppure *12/01*)"
 
     if "time" not in sess and "after" not in sess:
         return "Preferisci *mattina*, *pomeriggio* o *sera*? 😊"
@@ -635,9 +607,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             "Nel foglio Google, tab *operators*, aggiungi almeno un operatore con calendar_id."
         )
 
-    # ========================================================
-    # CERCA 2 OPZIONI
-    # ========================================================
+    # cerca 2 opzioni
     service = sess["service"]
     dur = int(service.get("duration", 30))
     base = dt.date.fromisoformat(sess["date"])
@@ -689,12 +659,10 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
     msg += "Se vuoi un operatore specifico scrivi: *con Marco* oppure *non Marco* 😊"
     return msg
 
-
 # ============================================================
 # META SIGNATURE VERIFY (opzionale ma consigliata)
 # ============================================================
 def verify_meta_signature(req) -> bool:
-    # Meta manda header: X-Hub-Signature-256: sha256=...
     if not META_APP_SECRET:
         return True  # se non lo imposti, saltiamo verifica
     sig = req.headers.get("X-Hub-Signature-256", "")
@@ -703,7 +671,6 @@ def verify_meta_signature(req) -> bool:
     their = sig.split("=", 1)[1].strip()
     mac = hmac.new(META_APP_SECRET.encode("utf-8"), msg=req.data, digestmod=hashlib.sha256).hexdigest()
     return hmac.compare_digest(mac, their)
-
 
 # ============================================================
 # WHATSAPP SEND
@@ -730,42 +697,41 @@ def wa_send_text(to_phone: str, text: str, phone_number_id: Optional[str] = None
     if r.status_code >= 300:
         raise RuntimeError(f"WhatsApp send failed: {r.status_code} {r.text}")
 
+# ============================================================
+# ROUTES (IMPORTANTE: evita 404 sul dominio)
+# ============================================================
+@app.route("/", methods=["GET"])
+def home():
+    return "OK - WhatsApp Bot online ✅", 200
 
-# ============================================================
-# ROUTES
-# ============================================================
-@app.route("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True}), 200
 
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
-    # Meta challenge
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
-
     if mode == "subscribe" and token and token == META_VERIFY_TOKEN:
         return challenge or "", 200
     return "Forbidden", 403
 
 @app.route("/webhook", methods=["POST"])
 def webhook_receive():
+    # Rispondiamo 200 sempre a Meta il più velocemente possibile
     if not verify_meta_signature(request):
         return "Invalid signature", 403
 
     data = request.get_json(silent=True) or {}
-    # rispondi subito 200 a Meta (importante)
-    # poi processi
+
     try:
-        # struttura tipica:
-        # entry[0].changes[0].value.messages[0]
         entries = data.get("entry", [])
         for entry in entries:
             changes = entry.get("changes", [])
             for ch in changes:
-                value = ch.get("value", {})
-                metadata = value.get("metadata", {})
+                value = ch.get("value", {}) or {}
+                metadata = value.get("metadata", {}) or {}
                 display_phone_number = metadata.get("display_phone_number", "")
                 phone_number_id = metadata.get("phone_number_id", "")
 
@@ -777,6 +743,7 @@ def webhook_receive():
 
                     from_phone = m.get("from", "")
                     mtype = m.get("type", "")
+
                     if mtype != "text":
                         wa_send_text(from_phone, "Per ora gestisco solo messaggi di testo 🙂", phone_number_id=phone_number_id)
                         continue
@@ -784,22 +751,21 @@ def webhook_receive():
                     text = ((m.get("text") or {}).get("body")) or ""
                     shop = load_shop_by_display_number(display_phone_number)
                     if not shop:
-                        wa_send_text(from_phone, "Numero salone non configurato nel foglio (tab shops).", phone_number_id=phone_number_id)
+                        wa_send_text(from_phone, "Numero non configurato nel foglio (tab shops).", phone_number_id=phone_number_id)
                         continue
 
                     reply = handle(shop, from_phone, text)
                     wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
 
     except Exception as e:
-        # log minimo su stdout (Railway logs)
+        # non crashare: log nei Railway logs
         print("Webhook processing error:", str(e))
 
     return "OK", 200
 
 # Test manuale via browser
-@app.route("/test")
+@app.route("/test", methods=["GET"])
 def test():
-    # phone = whatsapp_number del salone (come in sheet)
     phone = request.args.get("phone")
     customer = request.args.get("customer")
     msg = request.args.get("msg", "")
@@ -807,10 +773,7 @@ def test():
     if not phone or not customer:
         return jsonify({"error": "missing phone or customer"}), 400
 
-    shop = None
-    # qui riusiamo loader shop per numero display
     shop = load_shop_by_display_number(phone)
-
     if not shop:
         return jsonify({"error": "shop not found"}), 404
 
@@ -821,7 +784,7 @@ def test():
         "customer": customer,
         "message_in": msg,
         "bot_reply": reply
-    })
+    }), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
