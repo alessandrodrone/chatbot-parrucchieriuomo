@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import os, re, json, difflib, uuid
+import os, re, json, difflib, uuid, hmac, hashlib
 import datetime as dt
 from typing import Dict, List, Optional, Tuple, Set
+
+import requests
 from flask import Flask, request, jsonify
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
 
 # ============================================================
 # APP
@@ -14,17 +17,30 @@ from googleapiclient.discovery import build
 app = Flask(__name__)
 
 # ============================================================
-# ENV
+# ENV - GOOGLE
 # ============================================================
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "30"))
 
+# ============================================================
+# ENV - META WHATSAPP CLOUD
+# ============================================================
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
+META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "")  # usato per inviare
+META_APP_SECRET = os.getenv("META_APP_SECRET", "")  # per verificare firma (consigliato)
+GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v20.0")
+
+# ============================================================
+# ENV - BOT SETTINGS
+# ============================================================
+SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "30"))
 MAX_LOOKAHEAD_DAYS = int(os.getenv("MAX_LOOKAHEAD_DAYS", "14"))
 DEFAULT_SLOT_MINUTES = int(os.getenv("DEFAULT_SLOT_MINUTES", "30"))
 
 # parole chiave che bloccano sempre lo slot (anche se evento non-busy)
 BLOCK_KEYWORDS = {"chiuso", "ferie", "malattia", "off", "closed", "vacation", "sick"}
+
 
 # ============================================================
 # GOOGLE CLIENTS
@@ -54,6 +70,7 @@ def calendar():
         _calendar = build("calendar", "v3", credentials=creds(), cache_discovery=False)
     return _calendar
 
+
 # ============================================================
 # UTILS
 # ============================================================
@@ -61,7 +78,7 @@ def norm_phone(p: str) -> str:
     return re.sub(r"\D+", "", p or "")
 
 def now() -> dt.datetime:
-    # Se vuoi timezone fisso: imposta TZ=Europe/Rome su Railway
+    # Railway: imposta TZ=Europe/Rome
     return dt.datetime.now()
 
 def parse_bool(v: str) -> bool:
@@ -88,6 +105,7 @@ def _is_affirmative(t: str) -> bool:
 
 def _is_second_choice(t: str) -> bool:
     return safe_lower(t) == "2"
+
 
 # ============================================================
 # DATE / TIME PARSING (semplice)
@@ -136,6 +154,7 @@ def parse_fascia(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
         return dt.time(17, 0), dt.time(21, 0)
     return None, None
 
+
 # ============================================================
 # FUZZY SERVICE MATCH
 # ============================================================
@@ -149,6 +168,7 @@ def fuzzy_service(text: str, services: List[Dict]) -> Optional[Dict]:
             if safe_lower(s.get("name", "")) == target:
                 return s
     return None
+
 
 # ============================================================
 # SHEETS LOADERS
@@ -168,8 +188,9 @@ def load_tab(tab: str) -> List[Dict]:
         out.append(row)
     return out
 
-def load_shop(phone: str) -> Optional[Dict]:
-    phone_n = norm_phone(phone)
+def load_shop_by_display_number(display_phone_number: str) -> Optional[Dict]:
+    # dal webhook arriva +39 .... -> normalizziamo e confrontiamo con shops.whatsapp_number
+    phone_n = norm_phone(display_phone_number)
     for s in load_tab("shops"):
         if norm_phone(s.get("whatsapp_number")) == phone_n:
             return s
@@ -216,8 +237,10 @@ def load_operators(shop_id: str) -> List[Dict]:
     ops.sort(key=lambda x: (x["priority"], safe_lower(x["operator_name"])))
     return ops
 
+
 # ============================================================
-# SESSION (MEMORIA BREVE)
+# SESSION (memoria breve) - in-memory
+# NOTA: per vendibile -> spostare su Postgres (consigliato)
 # ============================================================
 SESSIONS: Dict[str, Dict] = {}
 
@@ -237,8 +260,30 @@ def clear_session(key: str):
     if key in SESSIONS:
         del SESSIONS[key]
 
+
 # ============================================================
-# OPERATOR PREFERENCES (con Marco / non Marco)
+# DEDUP message ids (anti doppia risposta)
+# ============================================================
+PROCESSED_MSG_IDS: Dict[str, dt.datetime] = {}
+
+def _gc_processed(ttl_minutes: int = 60):
+    cut = now() - dt.timedelta(minutes=ttl_minutes)
+    for k, ts in list(PROCESSED_MSG_IDS.items()):
+        if ts < cut:
+            del PROCESSED_MSG_IDS[k]
+
+def seen_message(message_id: str) -> bool:
+    _gc_processed()
+    if not message_id:
+        return False
+    if message_id in PROCESSED_MSG_IDS:
+        return True
+    PROCESSED_MSG_IDS[message_id] = now()
+    return False
+
+
+# ============================================================
+# OPERATOR PREFERENCES
 # ============================================================
 def operator_label(op: Dict) -> str:
     return op.get("operator_name") or op.get("operator_id") or "Operatore"
@@ -274,6 +319,7 @@ def parse_operator_prefs(text: str, operators: List[Dict]) -> Tuple[Optional[str
 
     return preferred, excluded
 
+
 # ============================================================
 # CALENDAR HELPERS
 # ============================================================
@@ -301,7 +347,6 @@ def slot_is_free(calendar_id: str, start: dt.datetime, end: dt.datetime) -> bool
     return True
 
 def find_event_by_booking_key(calendar_id: str, start: dt.datetime, end: dt.datetime, booking_key: str) -> Optional[Dict]:
-    # cerchiamo nella finestra dello slot (più un buffer piccolo)
     buf_start = (start - dt.timedelta(minutes=5)).isoformat()
     buf_end = (end + dt.timedelta(minutes=5)).isoformat()
     evs = calendar().events().list(
@@ -331,7 +376,6 @@ def create_booking_event(
     booking_key: str,
     notes: str = ""
 ) -> str:
-    # idempotenza: se già esiste evento con booking_key, non duplicare
     existing = find_event_by_booking_key(calendar_id, start, end, booking_key)
     if existing:
         return existing.get("id", "")
@@ -372,6 +416,7 @@ def create_booking_event(
 
     ev = calendar().events().insert(calendarId=calendar_id, body=body).execute()
     return ev.get("id", "")
+
 
 # ============================================================
 # SEARCH (ritorna fino a N opzioni)
@@ -453,8 +498,9 @@ def find_best_slots(
 
     return results
 
+
 # ============================================================
-# CORE BOT LOGIC v3.3
+# CORE BOT LOGIC
 # ============================================================
 def handle(shop: Dict, customer_phone: str, text: str) -> str:
     shop_id = shop["shop_id"]
@@ -509,7 +555,6 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             booking_id = sess.get("booking_id") or uuid.uuid4().hex[:10]
             customer_name = sess.get("customer_name") or "Cliente"
 
-            # booking_key deterministica: stesso cliente+servizio+slot+shop -> stessa chiave
             bk_raw = f"{shop_id}|{norm_phone(customer_phone)}|{service.get('name','')}|{start.isoformat()}"
             booking_key = uuid.uuid5(uuid.NAMESPACE_URL, bk_raw).hex
 
@@ -537,9 +582,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
                 "A presto 😊"
             )
 
-        # se rifiuta o dice "non Marco", escludi l'opzione 1 e riprova
         if ("non " in low) or ("senza " in low) or low in {"no", "cambia", "altro"}:
-            # escludi operatore della prima opzione proposta
             first_op = sess["options"][0]["operator"]
             oid = first_op.get("operator_id")
             if oid:
@@ -550,7 +593,6 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             sess["state"] = "searching"
             sess.pop("options", None)
             save_session(key, sess)
-            # continua sotto per ricercare nuove opzioni
 
     # ========================================================
     # SERVIZIO
@@ -587,7 +629,6 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
     if "time" not in sess and "after" not in sess:
         return "Preferisci *mattina*, *pomeriggio* o *sera*? 😊"
 
-    # operatori
     if not operators:
         return (
             "Mi manca la configurazione degli operatori 😕\n"
@@ -628,20 +669,15 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             "Vuoi provare un altro giorno o un’altra fascia?"
         )
 
-    # prepara opzioni per sessione
     packed = []
     for slot_dt, op in options:
-        packed.append({
-            "slot": slot_dt.isoformat(),
-            "operator": op
-        })
+        packed.append({"slot": slot_dt.isoformat(), "operator": op})
 
     sess["options"] = packed
     sess["state"] = "await_choice"
     sess["booking_id"] = sess.get("booking_id") or uuid.uuid4().hex[:10]
     save_session(key, sess)
 
-    # risposta: 1 o 2, con operatore
     msg = "Ti propongo questi orari 👇\n\n"
     slot1, op1 = options[0]
     msg += f"1) 🕒 {slot1.strftime('%a %d/%m %H:%M')} — con *{operator_label(op1)}*\n"
@@ -653,16 +689,128 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
     msg += "Se vuoi un operatore specifico scrivi: *con Marco* oppure *non Marco* 😊"
     return msg
 
+
 # ============================================================
-# ROUTE (test)
+# META SIGNATURE VERIFY (opzionale ma consigliata)
 # ============================================================
+def verify_meta_signature(req) -> bool:
+    # Meta manda header: X-Hub-Signature-256: sha256=...
+    if not META_APP_SECRET:
+        return True  # se non lo imposti, saltiamo verifica
+    sig = req.headers.get("X-Hub-Signature-256", "")
+    if not sig.startswith("sha256="):
+        return False
+    their = sig.split("=", 1)[1].strip()
+    mac = hmac.new(META_APP_SECRET.encode("utf-8"), msg=req.data, digestmod=hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, their)
+
+
+# ============================================================
+# WHATSAPP SEND
+# ============================================================
+def wa_send_text(to_phone: str, text: str, phone_number_id: Optional[str] = None):
+    pid = phone_number_id or META_PHONE_NUMBER_ID
+    if not pid:
+        raise RuntimeError("Missing META_PHONE_NUMBER_ID env var")
+    if not META_ACCESS_TOKEN:
+        raise RuntimeError("Missing META_ACCESS_TOKEN env var")
+
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{pid}/messages"
+    headers = {
+        "Authorization": f"Bearer {META_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": norm_phone(to_phone),
+        "type": "text",
+        "text": {"body": text},
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=15)
+    if r.status_code >= 300:
+        raise RuntimeError(f"WhatsApp send failed: {r.status_code} {r.text}")
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+@app.route("/health")
+def health():
+    return jsonify({"ok": True}), 200
+
+@app.route("/webhook", methods=["GET"])
+def webhook_verify():
+    # Meta challenge
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+
+    if mode == "subscribe" and token and token == META_VERIFY_TOKEN:
+        return challenge or "", 200
+    return "Forbidden", 403
+
+@app.route("/webhook", methods=["POST"])
+def webhook_receive():
+    if not verify_meta_signature(request):
+        return "Invalid signature", 403
+
+    data = request.get_json(silent=True) or {}
+    # rispondi subito 200 a Meta (importante)
+    # poi processi
+    try:
+        # struttura tipica:
+        # entry[0].changes[0].value.messages[0]
+        entries = data.get("entry", [])
+        for entry in entries:
+            changes = entry.get("changes", [])
+            for ch in changes:
+                value = ch.get("value", {})
+                metadata = value.get("metadata", {})
+                display_phone_number = metadata.get("display_phone_number", "")
+                phone_number_id = metadata.get("phone_number_id", "")
+
+                messages = value.get("messages", []) or []
+                for m in messages:
+                    msg_id = m.get("id", "")
+                    if msg_id and seen_message(msg_id):
+                        continue
+
+                    from_phone = m.get("from", "")
+                    mtype = m.get("type", "")
+                    if mtype != "text":
+                        wa_send_text(from_phone, "Per ora gestisco solo messaggi di testo 🙂", phone_number_id=phone_number_id)
+                        continue
+
+                    text = ((m.get("text") or {}).get("body")) or ""
+                    shop = load_shop_by_display_number(display_phone_number)
+                    if not shop:
+                        wa_send_text(from_phone, "Numero salone non configurato nel foglio (tab shops).", phone_number_id=phone_number_id)
+                        continue
+
+                    reply = handle(shop, from_phone, text)
+                    wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
+
+    except Exception as e:
+        # log minimo su stdout (Railway logs)
+        print("Webhook processing error:", str(e))
+
+    return "OK", 200
+
+# Test manuale via browser
 @app.route("/test")
 def test():
-    phone = request.args.get("phone")          # whatsapp_number del salone
-    customer = request.args.get("customer")    # numero cliente
+    # phone = whatsapp_number del salone (come in sheet)
+    phone = request.args.get("phone")
+    customer = request.args.get("customer")
     msg = request.args.get("msg", "")
 
-    shop = load_shop(phone)
+    if not phone or not customer:
+        return jsonify({"error": "missing phone or customer"}), 400
+
+    shop = None
+    # qui riusiamo loader shop per numero display
+    shop = load_shop_by_display_number(phone)
+
     if not shop:
         return jsonify({"error": "shop not found"}), 404
 
