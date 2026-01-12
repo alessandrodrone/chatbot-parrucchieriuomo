@@ -22,12 +22,28 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 
 # ============================================================
-# ENV - META WHATSAPP CLOUD
+# ENV - META WHATSAPP CLOUD (compatibilità nomi)
 # ============================================================
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "")
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
-META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID", "")  # usato per inviare
-META_APP_SECRET = os.getenv("META_APP_SECRET", "")            # firma webhook (opzionale ma consigliata)
+# Verifica webhook: Meta usa "hub.verify_token" che deve matchare questo valore.
+# Compatibile con: META_VERIFY_TOKEN oppure VERIFY_TOKEN
+META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN", "")
+
+# Token accesso Graph API (Cloud API):
+# Compatibile con: META_ACCESS_TOKEN oppure WHATSAPP_TOKEN
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN", "")
+
+# Phone Number ID:
+# Compatibile con: META_PHONE_NUMBER_ID oppure PHONE_NUMBER_ID oppure NUMERO_DI_TELEFONO (se lo usavi così)
+META_PHONE_NUMBER_ID = (
+    os.getenv("META_PHONE_NUMBER_ID")
+    or os.getenv("PHONE_NUMBER_ID")
+    or os.getenv("NUMERO_DI_TELEFONO", "")
+)
+
+# App secret per validare la firma del webhook:
+# Compatibile con: META_APP_SECRET oppure META_API_SECRET
+META_APP_SECRET = os.getenv("META_APP_SECRET") or os.getenv("META_API_SECRET", "")
+
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v20.0")
 
 # ============================================================
@@ -55,6 +71,11 @@ def creds():
         "https://www.googleapis.com/auth/calendar",
     ]
     return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+
+def sheets():
+    global _sheets
+    if not _sheets:
+        _sheets = build("sheets", "sheets", credentials=creds(), cache_discovery=False)
 
 def sheets():
     global _sheets
@@ -514,7 +535,6 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             cur_excl |= set(excl)
             sess["excluded_operator_ids"] = list(cur_excl)
 
-    # Stato: scelta opzioni
     if sess.get("state") == "await_choice" and sess.get("options"):
         if _is_affirmative(text) or _is_second_choice(text):
             idx = 0 if _is_affirmative(text) else 1
@@ -570,7 +590,6 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             sess.pop("options", None)
             save_session(key, sess)
 
-    # servizio
     if "service" not in sess:
         service = fuzzy_service(text, services)
         if service:
@@ -580,7 +599,6 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             lst = "\n".join(f"• {s['name']}" for s in services) if services else "• (nessun servizio configurato)"
             return "Dimmi solo che servizio ti serve:\n" + lst
 
-    # data/orario
     d = parse_date(text)
     t = parse_time(text)
     a, b = parse_fascia(text)
@@ -607,7 +625,6 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             "Nel foglio Google, tab *operators*, aggiungi almeno un operatore con calendar_id."
         )
 
-    # cerca 2 opzioni
     service = sess["service"]
     dur = int(service.get("duration", 30))
     base = dt.date.fromisoformat(sess["date"])
@@ -664,12 +681,14 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
 # ============================================================
 def verify_meta_signature(req) -> bool:
     if not META_APP_SECRET:
-        return True  # se non lo imposti, saltiamo verifica
+        return True
+
     sig = req.headers.get("X-Hub-Signature-256", "")
     if not sig.startswith("sha256="):
         return False
+
     their = sig.split("=", 1)[1].strip()
-    mac = hmac.new(META_APP_SECRET.encode("utf-8"), msg=req.data, digestmod=hashlib.sha256).hexdigest()
+    mac = hmac.new(META_APP_SECRET.encode("utf-8"), msg=req.get_data(), digestmod=hashlib.sha256).hexdigest()
     return hmac.compare_digest(mac, their)
 
 # ============================================================
@@ -678,9 +697,9 @@ def verify_meta_signature(req) -> bool:
 def wa_send_text(to_phone: str, text: str, phone_number_id: Optional[str] = None):
     pid = phone_number_id or META_PHONE_NUMBER_ID
     if not pid:
-        raise RuntimeError("Missing META_PHONE_NUMBER_ID env var")
+        raise RuntimeError("Missing META_PHONE_NUMBER_ID / PHONE_NUMBER_ID env var")
     if not META_ACCESS_TOKEN:
-        raise RuntimeError("Missing META_ACCESS_TOKEN env var")
+        raise RuntimeError("Missing META_ACCESS_TOKEN / WHATSAPP_TOKEN env var")
 
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{pid}/messages"
     headers = {
@@ -698,7 +717,7 @@ def wa_send_text(to_phone: str, text: str, phone_number_id: Optional[str] = None
         raise RuntimeError(f"WhatsApp send failed: {r.status_code} {r.text}")
 
 # ============================================================
-# ROUTES (IMPORTANTE: evita 404 sul dominio)
+# ROUTES
 # ============================================================
 @app.route("/", methods=["GET"])
 def home():
@@ -708,18 +727,21 @@ def home():
 def health():
     return jsonify({"ok": True}), 200
 
-@app.route("/webhook", methods=["GET"])
-def webhook_verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token and token == META_VERIFY_TOKEN:
-        return challenge or "", 200
-    return "Forbidden", 403
+# ✅ Un unico handler per /webhook (GET + POST) = più semplice, meno rischi
+@app.route("/webhook", methods=["GET", "POST"])
+def webhook():
+    if request.method == "GET":
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
 
-@app.route("/webhook", methods=["POST"])
-def webhook_receive():
-    # Rispondiamo 200 sempre a Meta il più velocemente possibile
+        if mode == "subscribe" and token and token == META_VERIFY_TOKEN:
+            # IMPORTANTISSIMO: solo challenge come testo puro
+            return (challenge or ""), 200
+
+        return "Forbidden", 403
+
+    # POST
     if not verify_meta_signature(request):
         return "Invalid signature", 403
 
@@ -758,7 +780,6 @@ def webhook_receive():
                     wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
 
     except Exception as e:
-        # non crashare: log nei Railway logs
         print("Webhook processing error:", str(e))
 
     return "OK", 200
