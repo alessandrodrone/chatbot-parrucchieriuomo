@@ -736,44 +736,50 @@ def webhook():
     data = request.get_json(silent=True) or {}
 
     try:
-        # log minimo per capire se arriva qualcosa
-        print("WEBHOOK POST received. keys:", list(data.keys()))
+        entries = data.get("entry", [])
+    for entry in entries:
+        changes = entry.get("changes", [])
+        for ch in changes:
+            value = ch.get("value", {}) or {}
+            metadata = value.get("metadata", {}) or {}
 
-        entries = data.get("entry", []) or []
-        for entry in entries:
-            changes = entry.get("changes", []) or []
-            for ch in changes:
-                value = ch.get("value", {}) or {}
-                metadata = value.get("metadata", {}) or {}
+            display_phone_number = metadata.get("display_phone_number", "")
 
-                display_phone_number = (metadata.get("display_phone_number") or "").strip()
+            phone_number_id = (metadata.get("phone_number_id") or "").strip()
+            # Forza quello vero se Meta manda ID finto (test event)
+            if not phone_number_id or phone_number_id != META_PHONE_NUMBER_ID:
+                phone_number_id = META_PHONE_NUMBER_ID
 
-                phone_number_id = (metadata.get("phone_number_id") or "").strip()
-                # Se Meta manda un ID fake (test payload) o vuoto, forza quello vero
-                if not phone_number_id or (META_PHONE_NUMBER_ID and phone_number_id != META_PHONE_NUMBER_ID):
-                    phone_number_id = META_PHONE_NUMBER_ID
+            messages = value.get("messages", []) or []
+            for m in messages:
+                msg_id = m.get("id", "")
+                if msg_id and seen_message(msg_id):
+                    continue
 
-                messages = value.get("messages", []) or []
-                for m in messages:
-                    msg_id = (m.get("id") or "").strip()
-                    if msg_id and seen_message(msg_id):
-                        continue
+                from_phone = m.get("from", "")
+                mtype = m.get("type", "")
 
-                    from_phone = (m.get("from") or "").strip()
-                    mtype = (m.get("type") or "").strip()
+                if mtype != "text":
+                    wa_send_text(
+                        from_phone,
+                        "Per ora gestisco solo messaggi di testo 🙂",
+                        phone_number_id=phone_number_id
+                    )
+                    continue
 
-                    if mtype != "text":
-                        wa_send_text(from_phone, "Per ora gestisco solo messaggi di testo 🙂", phone_number_id=phone_number_id)
-                        continue
+                text = ((m.get("text") or {}).get("body")) or ""
 
-                    text = ((m.get("text") or {}).get("body")) or ""
-                    shop = load_shop_by_display_number(display_phone_number)
-                    if not shop:
-                        wa_send_text(from_phone, "Numero non configurato nel foglio (tab shops).", phone_number_id=phone_number_id)
-                        continue
+                shop = load_shop_by_display_number(display_phone_number)
+                if not shop:
+                    wa_send_text(
+                        from_phone,
+                        "Numero non configurato nel foglio (tab shops).",
+                        phone_number_id=phone_number_id
+                    )
+                    continue
 
-                    reply = handle(shop, from_phone, text)
-                    wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
+                reply = handle(shop, from_phone, text)
+                wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
 
     except Exception as e:
         print("Webhook processing error:", str(e))
