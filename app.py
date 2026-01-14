@@ -24,26 +24,16 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 # ============================================================
 # ENV - META WHATSAPP CLOUD (compatibilità nomi)
 # ============================================================
-# Verifica webhook: Meta usa "hub.verify_token" che deve matchare questo valore.
-# Compatibile con: META_VERIFY_TOKEN oppure VERIFY_TOKEN
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN", "")
-
-# Token accesso Graph API (Cloud API):
-# Compatibile con: META_ACCESS_TOKEN oppure WHATSAPP_TOKEN
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN", "")
 
-# Phone Number ID:
-# Compatibile con: META_PHONE_NUMBER_ID oppure PHONE_NUMBER_ID oppure NUMERO_DI_TELEFONO (se lo usavi così)
 META_PHONE_NUMBER_ID = (
     os.getenv("META_PHONE_NUMBER_ID")
     or os.getenv("PHONE_NUMBER_ID")
     or os.getenv("NUMERO_DI_TELEFONO", "")
 )
 
-# App secret per validare la firma del webhook:
-# Compatibile con: META_APP_SECRET oppure META_API_SECRET
 META_APP_SECRET = os.getenv("META_APP_SECRET") or os.getenv("META_API_SECRET", "")
-
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v20.0")
 
 # ============================================================
@@ -71,11 +61,6 @@ def creds():
         "https://www.googleapis.com/auth/calendar",
     ]
     return service_account.Credentials.from_service_account_info(info, scopes=scopes)
-
-def sheets():
-    global _sheets
-    if not _sheets:
-        _sheets = build("sheets", "sheets", credentials=creds(), cache_discovery=False)
 
 def sheets():
     global _sheets
@@ -680,6 +665,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
 # META SIGNATURE VERIFY (opzionale ma consigliata)
 # ============================================================
 def verify_meta_signature(req) -> bool:
+    # Se non hai META_APP_SECRET, non bloccare i webhook
     if not META_APP_SECRET:
         return True
 
@@ -688,14 +674,18 @@ def verify_meta_signature(req) -> bool:
         return False
 
     their = sig.split("=", 1)[1].strip()
-    mac = hmac.new(META_APP_SECRET.encode("utf-8"), msg=req.get_data(), digestmod=hashlib.sha256).hexdigest()
+    mac = hmac.new(
+        META_APP_SECRET.encode("utf-8"),
+        msg=req.get_data(),
+        digestmod=hashlib.sha256
+    ).hexdigest()
     return hmac.compare_digest(mac, their)
 
 # ============================================================
 # WHATSAPP SEND
 # ============================================================
 def wa_send_text(to_phone: str, text: str, phone_number_id: Optional[str] = None):
-    pid = phone_number_id or META_PHONE_NUMBER_ID
+    pid = (phone_number_id or "").strip() or META_PHONE_NUMBER_ID
     if not pid:
         raise RuntimeError("Missing META_PHONE_NUMBER_ID / PHONE_NUMBER_ID env var")
     if not META_ACCESS_TOKEN:
@@ -727,7 +717,6 @@ def home():
 def health():
     return jsonify({"ok": True}), 200
 
-# ✅ Un unico handler per /webhook (GET + POST) = più semplice, meno rischi
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -736,7 +725,6 @@ def webhook():
         challenge = request.args.get("hub.challenge")
 
         if mode == "subscribe" and token and token == META_VERIFY_TOKEN:
-            # IMPORTANTISSIMO: solo challenge come testo puro
             return (challenge or ""), 200
 
         return "Forbidden", 403
@@ -748,28 +736,31 @@ def webhook():
     data = request.get_json(silent=True) or {}
 
     try:
-        entries = data.get("entry", [])
+        # log minimo per capire se arriva qualcosa
+        print("WEBHOOK POST received. keys:", list(data.keys()))
+
+        entries = data.get("entry", []) or []
         for entry in entries:
-            changes = entry.get("changes", [])
+            changes = entry.get("changes", []) or []
             for ch in changes:
                 value = ch.get("value", {}) or {}
                 metadata = value.get("metadata", {}) or {}
-display_phone_number = metadata.get("display_phone_number", "")
 
-phone_number_id = (metadata.get("phone_number_id") or "").strip()
+                display_phone_number = (metadata.get("display_phone_number") or "").strip()
 
-# Se Meta manda un ID fake (es. payload di test), forza quello vero
-if not phone_number_id or phone_number_id != META_PHONE_NUMBER_ID:
-    phone_number_id = META_PHONE_NUMBER_ID
+                phone_number_id = (metadata.get("phone_number_id") or "").strip()
+                # Se Meta manda un ID fake (test payload) o vuoto, forza quello vero
+                if not phone_number_id or (META_PHONE_NUMBER_ID and phone_number_id != META_PHONE_NUMBER_ID):
+                    phone_number_id = META_PHONE_NUMBER_ID
 
                 messages = value.get("messages", []) or []
                 for m in messages:
-                    msg_id = m.get("id", "")
+                    msg_id = (m.get("id") or "").strip()
                     if msg_id and seen_message(msg_id):
                         continue
 
-                    from_phone = m.get("from", "")
-                    mtype = m.get("type", "")
+                    from_phone = (m.get("from") or "").strip()
+                    mtype = (m.get("type") or "").strip()
 
                     if mtype != "text":
                         wa_send_text(from_phone, "Per ora gestisco solo messaggi di testo 🙂", phone_number_id=phone_number_id)
