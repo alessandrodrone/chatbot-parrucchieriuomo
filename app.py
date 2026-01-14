@@ -754,8 +754,13 @@ def webhook():
             for ch in changes:
                 value = ch.get("value", {}) or {}
                 metadata = value.get("metadata", {}) or {}
-                display_phone_number = metadata.get("display_phone_number", "")
-                phone_number_id = metadata.get("phone_number_id", "")
+display_phone_number = metadata.get("display_phone_number", "")
+
+phone_number_id = (metadata.get("phone_number_id") or "").strip()
+
+# Se Meta manda un ID fake (es. payload di test), forza quello vero
+if not phone_number_id or phone_number_id != META_PHONE_NUMBER_ID:
+    phone_number_id = META_PHONE_NUMBER_ID
 
                 messages = value.get("messages", []) or []
                 for m in messages:
