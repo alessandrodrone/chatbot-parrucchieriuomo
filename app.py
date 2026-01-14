@@ -665,7 +665,6 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
 # META SIGNATURE VERIFY (opzionale ma consigliata)
 # ============================================================
 def verify_meta_signature(req) -> bool:
-    # Se non hai META_APP_SECRET, non bloccare i webhook
     if not META_APP_SECRET:
         return True
 
@@ -729,64 +728,61 @@ def webhook():
 
         return "Forbidden", 403
 
-    # POST
     if not verify_meta_signature(request):
         return "Invalid signature", 403
 
     data = request.get_json(silent=True) or {}
 
     try:
-        entries = data.get("entry", [])
-    for entry in entries:
-        changes = entry.get("changes", [])
-        for ch in changes:
-            value = ch.get("value", {}) or {}
-            metadata = value.get("metadata", {}) or {}
+        entries = data.get("entry", []) or []
+        for entry in entries:
+            changes = entry.get("changes", []) or []
+            for ch in changes:
+                value = ch.get("value", {}) or {}
+                metadata = value.get("metadata", {}) or {}
 
-            display_phone_number = metadata.get("display_phone_number", "")
+                display_phone_number = metadata.get("display_phone_number", "")
 
-            phone_number_id = (metadata.get("phone_number_id") or "").strip()
-            # Forza quello vero se Meta manda ID finto (test event)
-            if not phone_number_id or phone_number_id != META_PHONE_NUMBER_ID:
-                phone_number_id = META_PHONE_NUMBER_ID
+                phone_number_id = (metadata.get("phone_number_id") or "").strip()
+                if not phone_number_id or phone_number_id != META_PHONE_NUMBER_ID:
+                    phone_number_id = META_PHONE_NUMBER_ID
 
-            messages = value.get("messages", []) or []
-            for m in messages:
-                msg_id = m.get("id", "")
-                if msg_id and seen_message(msg_id):
-                    continue
+                messages = value.get("messages", []) or []
+                for m in messages:
+                    msg_id = m.get("id", "")
+                    if msg_id and seen_message(msg_id):
+                        continue
 
-                from_phone = m.get("from", "")
-                mtype = m.get("type", "")
+                    from_phone = m.get("from", "")
+                    mtype = m.get("type", "")
 
-                if mtype != "text":
-                    wa_send_text(
-                        from_phone,
-                        "Per ora gestisco solo messaggi di testo 🙂",
-                        phone_number_id=phone_number_id
-                    )
-                    continue
+                    if mtype != "text":
+                        wa_send_text(
+                            from_phone,
+                            "Per ora gestisco solo messaggi di testo 🙂",
+                            phone_number_id=phone_number_id
+                        )
+                        continue
 
-                text = ((m.get("text") or {}).get("body")) or ""
+                    text = ((m.get("text") or {}).get("body")) or ""
 
-                shop = load_shop_by_display_number(display_phone_number)
-                if not shop:
-                    wa_send_text(
-                        from_phone,
-                        "Numero non configurato nel foglio (tab shops).",
-                        phone_number_id=phone_number_id
-                    )
-                    continue
+                    shop = load_shop_by_display_number(display_phone_number)
+                    if not shop:
+                        wa_send_text(
+                            from_phone,
+                            "Numero non configurato nel foglio (tab shops).",
+                            phone_number_id=phone_number_id
+                        )
+                        continue
 
-                reply = handle(shop, from_phone, text)
-                wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
+                    reply = handle(shop, from_phone, text)
+                    wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
 
     except Exception as e:
         print("Webhook processing error:", str(e))
 
     return "OK", 200
 
-# Test manuale via browser
 @app.route("/test", methods=["GET"])
 def test():
     phone = request.args.get("phone")
