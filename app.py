@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import os, re, json, difflib, uuid, hmac, hashlib
+import os, re, json, difflib, uuid, hmac, hashlib, traceback
 import datetime as dt
 from typing import Dict, List, Optional, Tuple, Set
 
 import requests
 from flask import Flask, request, jsonify
+
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -14,6 +16,11 @@ from googleapiclient.discovery import build
 # APP
 # ============================================================
 app = Flask(__name__)
+# Consigliato dietro reverse proxy (Railway, ecc.)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+
+# Accetta /webhook e /webhook/ senza redirect
+app.url_map.strict_slashes = False
 
 # ============================================================
 # ENV - GOOGLE
@@ -35,6 +42,9 @@ META_PHONE_NUMBER_ID = (
 
 META_APP_SECRET = os.getenv("META_APP_SECRET") or os.getenv("META_API_SECRET", "")
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v20.0")
+
+# Se vuoi forzare la firma: true/false (default true)
+META_SIGNATURE_REQUIRED = (os.getenv("META_SIGNATURE_REQUIRED", "true").strip().lower() in {"true", "1", "yes", "y", "si", "sì"})
 
 # ============================================================
 # ENV - BOT SETTINGS
@@ -662,22 +672,37 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
     return msg
 
 # ============================================================
-# META SIGNATURE VERIFY (opzionale ma consigliata)
+# META SIGNATURE VERIFY
 # ============================================================
 def verify_meta_signature(req) -> bool:
+    # Se non hai impostato secret, non puoi verificare → ok
     if not META_APP_SECRET:
         return True
 
-    sig = req.headers.get("X-Hub-Signature-256", "")
+    # Header può arrivare in vari modi/case
+    sig = (
+        req.headers.get("X-Hub-Signature-256")
+        or req.headers.get("x-hub-signature-256")
+        or ""
+    )
+
+    # Se vuoi forzare firma e manca header → KO
+    if not sig:
+        return (not META_SIGNATURE_REQUIRED)
+
     if not sig.startswith("sha256="):
         return False
 
     their = sig.split("=", 1)[1].strip()
+
+    # IMPORTANTE: usa raw body bytes
+    raw = req.get_data(cache=True)  # bytes
     mac = hmac.new(
         META_APP_SECRET.encode("utf-8"),
-        msg=req.get_data(),
+        msg=raw,
         digestmod=hashlib.sha256
     ).hexdigest()
+
     return hmac.compare_digest(mac, their)
 
 # ============================================================
@@ -723,12 +748,18 @@ def webhook():
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
 
+        print(f"[WEBHOOK][GET] mode={mode} token_match={token == META_VERIFY_TOKEN}")
+
         if mode == "subscribe" and token and token == META_VERIFY_TOKEN:
             return (challenge or ""), 200
 
         return "Forbidden", 403
 
+    # LOG base: così in Railway vedi subito se arriva qualcosa
+    print(f"[WEBHOOK][POST] incoming from={request.remote_addr} len={request.content_length}")
+
     if not verify_meta_signature(request):
+        print("[WEBHOOK][POST] Invalid signature (check META_APP_SECRET / META_SIGNATURE_REQUIRED)")
         return "Invalid signature", 403
 
     data = request.get_json(silent=True) or {}
@@ -742,10 +773,7 @@ def webhook():
                 metadata = value.get("metadata", {}) or {}
 
                 display_phone_number = metadata.get("display_phone_number", "")
-
-                phone_number_id = (metadata.get("phone_number_id") or "").strip()
-                if not phone_number_id or phone_number_id != META_PHONE_NUMBER_ID:
-                    phone_number_id = META_PHONE_NUMBER_ID
+                phone_number_id = (metadata.get("phone_number_id") or "").strip() or META_PHONE_NUMBER_ID
 
                 messages = value.get("messages", []) or []
                 for m in messages:
@@ -755,6 +783,8 @@ def webhook():
 
                     from_phone = m.get("from", "")
                     mtype = m.get("type", "")
+
+                    print(f"[WEBHOOK] msg_id={msg_id} from={from_phone} type={mtype} display_phone={display_phone_number}")
 
                     if mtype != "text":
                         wa_send_text(
@@ -778,8 +808,8 @@ def webhook():
                     reply = handle(shop, from_phone, text)
                     wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
 
-    except Exception as e:
-        print("Webhook processing error:", str(e))
+    except Exception:
+        print("Webhook processing error:\n", traceback.format_exc())
 
     return "OK", 200
 
