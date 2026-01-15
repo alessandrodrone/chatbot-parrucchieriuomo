@@ -1,26 +1,24 @@
 from __future__ import annotations
 
-import os, re, json, difflib, uuid, hmac, hashlib, traceback
+import os, re, json, difflib, uuid, hmac, hashlib
 import datetime as dt
 from typing import Dict, List, Optional, Tuple, Set
 
 import requests
 from flask import Flask, request, jsonify
 
-from werkzeug.middleware.proxy_fix import ProxyFix
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
 
 # ============================================================
 # APP
 # ============================================================
 app = Flask(__name__)
-# Consigliato dietro reverse proxy (Railway, ecc.)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
-
-# Accetta /webhook e /webhook/ senza redirect
-app.url_map.strict_slashes = False
 
 # ============================================================
 # ENV - GOOGLE
@@ -43,9 +41,6 @@ META_PHONE_NUMBER_ID = (
 META_APP_SECRET = os.getenv("META_APP_SECRET") or os.getenv("META_API_SECRET", "")
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v20.0")
 
-# Se vuoi forzare la firma: true/false (default true)
-META_SIGNATURE_REQUIRED = (os.getenv("META_SIGNATURE_REQUIRED", "true").strip().lower() in {"true", "1", "yes", "y", "si", "sì"})
-
 # ============================================================
 # ENV - BOT SETTINGS
 # ============================================================
@@ -60,6 +55,11 @@ BLOCK_KEYWORDS = {"chiuso", "ferie", "malattia", "off", "closed", "vacation", "s
 _sheets = None
 _calendar = None
 
+
+def _log(msg: str):
+    print(msg, flush=True)
+
+
 def creds():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         raise RuntimeError("Missing GOOGLE_SERVICE_ACCOUNT_JSON env var")
@@ -72,11 +72,13 @@ def creds():
     ]
     return service_account.Credentials.from_service_account_info(info, scopes=scopes)
 
+
 def sheets():
     global _sheets
     if not _sheets:
         _sheets = build("sheets", "v4", credentials=creds(), cache_discovery=False)
     return _sheets
+
 
 def calendar():
     global _calendar
@@ -84,17 +86,21 @@ def calendar():
         _calendar = build("calendar", "v3", credentials=creds(), cache_discovery=False)
     return _calendar
 
+
 # ============================================================
 # UTILS
 # ============================================================
 def norm_phone(p: str) -> str:
     return re.sub(r"\D+", "", p or "")
 
+
 def now() -> dt.datetime:
-    return dt.datetime.now()
+    return dt.datetime.now(dt.timezone.utc)
+
 
 def parse_bool(v: str) -> bool:
     return str(v).strip().lower() in {"true", "1", "yes", "y", "si", "sì"}
+
 
 def parse_int(v: str, default: int) -> int:
     try:
@@ -102,21 +108,40 @@ def parse_int(v: str, default: int) -> int:
     except Exception:
         return default
 
+
 def norm_text(v: str) -> str:
     return (v or "").strip()
+
 
 def safe_lower(v: str) -> str:
     return norm_text(v).lower()
 
+
 def _iso_time(t: dt.time) -> str:
     return t.strftime("%H:%M")
+
 
 def _is_affirmative(t: str) -> bool:
     low = safe_lower(t)
     return low in {"ok", "va bene", "confermo", "si", "sì", "1"}
 
+
 def _is_second_choice(t: str) -> bool:
     return safe_lower(t) == "2"
+
+
+def shop_tz(shop: Dict) -> dt.tzinfo:
+    """
+    Usa il timezone dello shop se presente (es. Europe/Rome), altrimenti UTC.
+    """
+    tz_name = norm_text(shop.get("timezone")) or "UTC"
+    if ZoneInfo:
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            return dt.timezone.utc
+    return dt.timezone.utc
+
 
 # ============================================================
 # DATE / TIME PARSING (semplice)
@@ -146,12 +171,14 @@ def parse_date(text: str) -> Optional[dt.date]:
             return None
     return None
 
+
 def parse_time(text: str) -> Optional[dt.time]:
     t = safe_lower(text)
     m = re.search(r"\b([01]?\d|2[0-3])[:\.]?([0-5]\d)?\b", t)
     if m:
         return dt.time(int(m.group(1)), int(m.group(2) or 0))
     return None
+
 
 def parse_fascia(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
     t = safe_lower(text)
@@ -162,6 +189,7 @@ def parse_fascia(text: str) -> Tuple[Optional[dt.time], Optional[dt.time]]:
     if "tardo" in t or "sera" in t:
         return dt.time(17, 0), dt.time(21, 0)
     return None, None
+
 
 # ============================================================
 # FUZZY SERVICE MATCH
@@ -176,6 +204,7 @@ def fuzzy_service(text: str, services: List[Dict]) -> Optional[Dict]:
             if safe_lower(s.get("name", "")) == target:
                 return s
     return None
+
 
 # ============================================================
 # SHEETS LOADERS
@@ -195,12 +224,30 @@ def load_tab(tab: str) -> List[Dict]:
         out.append(row)
     return out
 
-def load_shop_by_display_number(display_phone_number: str) -> Optional[Dict]:
-    phone_n = norm_phone(display_phone_number)
-    for s in load_tab("shops"):
-        if norm_phone(s.get("whatsapp_number")) == phone_n:
-            return s
+
+def load_shop(display_phone_number: str, phone_number_id: str) -> Optional[Dict]:
+    """
+    Risolvi lo shop in modo robusto:
+    - prima prova per phone_number_id se nel foglio shops esiste colonna "phone_number_id"
+    - poi per display_phone_number contro "whatsapp_number"
+    """
+    pnid = norm_text(phone_number_id)
+    disp = norm_phone(display_phone_number)
+
+    shops = load_tab("shops")
+
+    if pnid:
+        for s in shops:
+            if norm_text(s.get("phone_number_id")) == pnid:
+                return s
+
+    if disp:
+        for s in shops:
+            if norm_phone(s.get("whatsapp_number")) == disp:
+                return s
+
     return None
+
 
 def load_services(shop_id: str) -> List[Dict]:
     return [
@@ -212,6 +259,7 @@ def load_services(shop_id: str) -> List[Dict]:
         for s in load_tab("services")
         if s.get("shop_id") == shop_id and parse_bool(s.get("active", "TRUE"))
     ]
+
 
 def load_hours(shop_id: str) -> Dict[int, List[Tuple[dt.time, dt.time]]]:
     out = {i: [] for i in range(7)}
@@ -225,6 +273,7 @@ def load_hours(shop_id: str) -> Dict[int, List[Tuple[dt.time, dt.time]]]:
             except Exception:
                 pass
     return out
+
 
 def load_operators(shop_id: str) -> List[Dict]:
     ops = []
@@ -243,10 +292,12 @@ def load_operators(shop_id: str) -> List[Dict]:
     ops.sort(key=lambda x: (x["priority"], safe_lower(x["operator_name"])))
     return ops
 
+
 # ============================================================
 # SESSION (memoria breve) - in-memory
 # ============================================================
 SESSIONS: Dict[str, Dict] = {}
+
 
 def get_session(key: str) -> Dict:
     s = SESSIONS.get(key)
@@ -257,23 +308,28 @@ def get_session(key: str) -> Dict:
         return {}
     return dict(s)
 
+
 def save_session(key: str, data: Dict):
     SESSIONS[key] = {"ts": now(), **data}
+
 
 def clear_session(key: str):
     if key in SESSIONS:
         del SESSIONS[key]
+
 
 # ============================================================
 # DEDUP message ids (anti doppia risposta)
 # ============================================================
 PROCESSED_MSG_IDS: Dict[str, dt.datetime] = {}
 
+
 def _gc_processed(ttl_minutes: int = 60):
     cut = now() - dt.timedelta(minutes=ttl_minutes)
     for k, ts in list(PROCESSED_MSG_IDS.items()):
         if ts < cut:
             del PROCESSED_MSG_IDS[k]
+
 
 def seen_message(message_id: str) -> bool:
     _gc_processed()
@@ -284,11 +340,13 @@ def seen_message(message_id: str) -> bool:
     PROCESSED_MSG_IDS[message_id] = now()
     return False
 
+
 # ============================================================
 # OPERATOR PREFERENCES
 # ============================================================
 def operator_label(op: Dict) -> str:
     return op.get("operator_name") or op.get("operator_id") or "Operatore"
+
 
 def _operator_tokens(op: Dict) -> List[str]:
     toks = []
@@ -297,6 +355,7 @@ def _operator_tokens(op: Dict) -> List[str]:
     if op.get("operator_id"):
         toks.append(safe_lower(op["operator_id"]))
     return list({t for t in toks if t})
+
 
 def parse_operator_prefs(text: str, operators: List[Dict]) -> Tuple[Optional[str], Set[str]]:
     t = " " + safe_lower(text) + " "
@@ -319,12 +378,14 @@ def parse_operator_prefs(text: str, operators: List[Dict]) -> Tuple[Optional[str
         preferred = None
     return preferred, excluded
 
+
 # ============================================================
 # CALENDAR HELPERS
 # ============================================================
 def _has_block_keyword(summary: str) -> bool:
     s = safe_lower(summary)
     return any(k in s for k in BLOCK_KEYWORDS)
+
 
 def slot_is_free(calendar_id: str, start: dt.datetime, end: dt.datetime) -> bool:
     evs = calendar().events().list(
@@ -345,6 +406,7 @@ def slot_is_free(calendar_id: str, start: dt.datetime, end: dt.datetime) -> bool
             return False
     return True
 
+
 def find_event_by_booking_key(calendar_id: str, start: dt.datetime, end: dt.datetime, booking_key: str) -> Optional[Dict]:
     buf_start = (start - dt.timedelta(minutes=5)).isoformat()
     buf_end = (end + dt.timedelta(minutes=5)).isoformat()
@@ -361,6 +423,7 @@ def find_event_by_booking_key(calendar_id: str, start: dt.datetime, end: dt.date
         if ep.get("booking_key") == booking_key:
             return ev
     return None
+
 
 def create_booking_event(
     calendar_id: str,
@@ -416,6 +479,7 @@ def create_booking_event(
     ev = calendar().events().insert(calendarId=calendar_id, body=body).execute()
     return ev.get("id", "")
 
+
 # ============================================================
 # SEARCH (ritorna fino a N opzioni)
 # ============================================================
@@ -430,6 +494,7 @@ def find_best_slots(
     before: Optional[dt.time],
     preferred_operator_id: Optional[str],
     excluded_operator_ids: Set[str],
+    tz: dt.tzinfo,
     limit: int = 2,
 ) -> List[Tuple[dt.datetime, Dict]]:
     ops_by_id = {op.get("operator_id"): op for op in operators if op.get("operator_id")}
@@ -461,13 +526,13 @@ def find_best_slots(
                 continue
 
             if preferred_time:
-                cand = dt.datetime.combine(day, preferred_time)
+                cand = dt.datetime.combine(day, preferred_time, tzinfo=tz)
                 if cand.time() >= sst and (cand + dt.timedelta(minutes=dur_min)).time() <= een:
                     return [cand]
                 return []
 
-            cur = dt.datetime.combine(day, sst)
-            limit_dt = dt.datetime.combine(day, een)
+            cur = dt.datetime.combine(day, sst, tzinfo=tz)
+            limit_dt = dt.datetime.combine(day, een, tzinfo=tz)
             while cur + dt.timedelta(minutes=dur_min) <= limit_dt:
                 slots.append(cur)
                 cur += dt.timedelta(minutes=slot_minutes)
@@ -496,10 +561,11 @@ def find_best_slots(
 
     return results
 
+
 # ============================================================
 # CORE BOT LOGIC
 # ============================================================
-def handle(shop: Dict, customer_phone: str, text: str) -> str:
+def handle(shop: Dict, customer_phone: str, text: str, customer_name: Optional[str] = None) -> str:
     shop_id = shop["shop_id"]
     key = f"{shop_id}:{norm_phone(customer_phone)}"
     sess = get_session(key)
@@ -510,6 +576,9 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
 
     slot_minutes = parse_int(shop.get("slot_minutes", ""), DEFAULT_SLOT_MINUTES)
     low = safe_lower(text)
+
+    if customer_name and "customer_name" not in sess:
+        sess["customer_name"] = customer_name
 
     if low in {"reset", "annulla", "cancella"}:
         clear_session(key)
@@ -544,7 +613,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
             end = start + dt.timedelta(minutes=dur)
 
             booking_id = sess.get("booking_id") or uuid.uuid4().hex[:10]
-            customer_name = sess.get("customer_name") or "Cliente"
+            cname = sess.get("customer_name") or "Cliente"
 
             bk_raw = f"{shop_id}|{norm_phone(customer_phone)}|{service.get('name','')}|{start.isoformat()}"
             booking_key = uuid.uuid5(uuid.NAMESPACE_URL, bk_raw).hex
@@ -554,7 +623,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
                 start=start,
                 end=end,
                 service_name=service["name"],
-                customer_name=customer_name,
+                customer_name=cname,
                 customer_phone=customer_phone,
                 shop_name=shop.get("name", ""),
                 operator_name=op.get("operator_name", ""),
@@ -631,6 +700,8 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
     preferred_operator_id = sess.get("preferred_operator_id")
     excluded_operator_ids = set(sess.get("excluded_operator_ids") or [])
 
+    tz = shop_tz(shop)
+
     options = find_best_slots(
         hours=hours,
         operators=operators,
@@ -642,6 +713,7 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
         before=before,
         preferred_operator_id=preferred_operator_id,
         excluded_operator_ids=excluded_operator_ids,
+        tz=tz,
         limit=2
     )
 
@@ -671,39 +743,26 @@ def handle(shop: Dict, customer_phone: str, text: str) -> str:
     msg += "Se vuoi un operatore specifico scrivi: *con Marco* oppure *non Marco* 😊"
     return msg
 
+
 # ============================================================
-# META SIGNATURE VERIFY
+# META SIGNATURE VERIFY (opzionale ma consigliata)
 # ============================================================
 def verify_meta_signature(req) -> bool:
-    # Se non hai impostato secret, non puoi verificare → ok
     if not META_APP_SECRET:
         return True
 
-    # Header può arrivare in vari modi/case
-    sig = (
-        req.headers.get("X-Hub-Signature-256")
-        or req.headers.get("x-hub-signature-256")
-        or ""
-    )
-
-    # Se vuoi forzare firma e manca header → KO
-    if not sig:
-        return (not META_SIGNATURE_REQUIRED)
-
+    sig = req.headers.get("X-Hub-Signature-256", "")
     if not sig.startswith("sha256="):
         return False
 
     their = sig.split("=", 1)[1].strip()
-
-    # IMPORTANTE: usa raw body bytes
-    raw = req.get_data(cache=True)  # bytes
     mac = hmac.new(
         META_APP_SECRET.encode("utf-8"),
-        msg=raw,
+        msg=req.get_data(),
         digestmod=hashlib.sha256
     ).hexdigest()
-
     return hmac.compare_digest(mac, their)
+
 
 # ============================================================
 # WHATSAPP SEND
@@ -730,6 +789,16 @@ def wa_send_text(to_phone: str, text: str, phone_number_id: Optional[str] = None
     if r.status_code >= 300:
         raise RuntimeError(f"WhatsApp send failed: {r.status_code} {r.text}")
 
+
+def _is_meta_sample_payload(display_phone: str, phone_number_id: str) -> bool:
+    """
+    Meta "Send to server" spesso manda:
+    display_phone_number=16505551111 e phone_number_id=123456123 (finto).
+    In quel caso NON dobbiamo rispondere.
+    """
+    return norm_phone(display_phone) == "16505551111" or norm_text(phone_number_id) == "123456123"
+
+
 # ============================================================
 # ROUTES
 # ============================================================
@@ -737,9 +806,11 @@ def wa_send_text(to_phone: str, text: str, phone_number_id: Optional[str] = None
 def home():
     return "OK - WhatsApp Bot online ✅", 200
 
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True}), 200
+
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
@@ -748,18 +819,12 @@ def webhook():
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
 
-        print(f"[WEBHOOK][GET] mode={mode} token_match={token == META_VERIFY_TOKEN}")
-
         if mode == "subscribe" and token and token == META_VERIFY_TOKEN:
             return (challenge or ""), 200
 
         return "Forbidden", 403
 
-    # LOG base: così in Railway vedi subito se arriva qualcosa
-    print(f"[WEBHOOK][POST] incoming from={request.remote_addr} len={request.content_length}")
-
     if not verify_meta_signature(request):
-        print("[WEBHOOK][POST] Invalid signature (check META_APP_SECRET / META_SIGNATURE_REQUIRED)")
         return "Invalid signature", 403
 
     data = request.get_json(silent=True) or {}
@@ -772,10 +837,16 @@ def webhook():
                 value = ch.get("value", {}) or {}
                 metadata = value.get("metadata", {}) or {}
 
-                display_phone_number = metadata.get("display_phone_number", "")
-                phone_number_id = (metadata.get("phone_number_id") or "").strip() or META_PHONE_NUMBER_ID
+                display_phone_number = metadata.get("display_phone_number", "") or ""
+                phone_number_id = (metadata.get("phone_number_id") or "").strip()
 
                 messages = value.get("messages", []) or []
+                contacts = value.get("contacts", []) or []
+                contact_name = None
+                if contacts:
+                    profile = (contacts[0].get("profile") or {})
+                    contact_name = profile.get("name")
+
                 for m in messages:
                     msg_id = m.get("id", "")
                     if msg_id and seen_message(msg_id):
@@ -784,34 +855,40 @@ def webhook():
                     from_phone = m.get("from", "")
                     mtype = m.get("type", "")
 
-                    print(f"[WEBHOOK] msg_id={msg_id} from={from_phone} type={mtype} display_phone={display_phone_number}")
+                    _log(f"[WEBHOOK] msg_id={msg_id} from={from_phone} type={mtype} display_phone={display_phone_number} phone_number_id={phone_number_id}")
+
+                    # Non rispondere ai payload di esempio (Meta "Send to server")
+                    if _is_meta_sample_payload(display_phone_number, phone_number_id):
+                        _log("[WEBHOOK] Meta sample payload detected -> skip reply (this is expected).")
+                        continue
 
                     if mtype != "text":
-                        wa_send_text(
-                            from_phone,
-                            "Per ora gestisco solo messaggi di testo 🙂",
-                            phone_number_id=phone_number_id
-                        )
+                        try:
+                            wa_send_text(from_phone, "Per ora gestisco solo messaggi di testo 🙂", phone_number_id=phone_number_id)
+                        except Exception as e:
+                            _log(f"[SEND] non-text reply failed: {e}")
                         continue
 
                     text = ((m.get("text") or {}).get("body")) or ""
 
-                    shop = load_shop_by_display_number(display_phone_number)
+                    shop = load_shop(display_phone_number, phone_number_id)
                     if not shop:
-                        wa_send_text(
-                            from_phone,
-                            "Numero non configurato nel foglio (tab shops).",
-                            phone_number_id=phone_number_id
-                        )
+                        _log(f"[WEBHOOK] shop NOT found for display_phone={display_phone_number} phone_number_id={phone_number_id}")
+                        # Nota: non rispondo se non trovo lo shop, per evitare errori su numeri test/finti
                         continue
 
-                    reply = handle(shop, from_phone, text)
-                    wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
+                    reply = handle(shop, from_phone, text, customer_name=contact_name)
 
-    except Exception:
-        print("Webhook processing error:\n", traceback.format_exc())
+                    try:
+                        wa_send_text(from_phone, reply, phone_number_id=phone_number_id)
+                    except Exception as e:
+                        _log(f"[SEND] reply failed: {e}")
+
+    except Exception as e:
+        _log(f"[WEBHOOK] processing error: {e}")
 
     return "OK", 200
+
 
 @app.route("/test", methods=["GET"])
 def test():
@@ -822,7 +899,8 @@ def test():
     if not phone or not customer:
         return jsonify({"error": "missing phone or customer"}), 400
 
-    shop = load_shop_by_display_number(phone)
+    # qui non abbiamo phone_number_id, quindi passiamo stringa vuota
+    shop = load_shop(phone, "")
     if not shop:
         return jsonify({"error": "shop not found"}), 404
 
@@ -834,6 +912,7 @@ def test():
         "message_in": msg,
         "bot_reply": reply
     }), 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
