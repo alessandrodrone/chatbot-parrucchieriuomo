@@ -50,9 +50,10 @@ MAX_LOOKAHEAD_DAYS = int(os.getenv("MAX_LOOKAHEAD_DAYS", "14"))
 DEFAULT_SLOT_MINUTES = int(os.getenv("DEFAULT_SLOT_MINUTES", "30"))
 BLOCK_KEYWORDS = {"chiuso", "ferie", "malattia", "off", "closed", "vacation", "sick"}
 
-# Quanto dura l'associazione cliente->shop nel tab customers
-# 0 = non scade mai
+# Quanto dura l'associazione cliente->shop nel tab customers (se 0 non scade mai)
 CUSTOMER_SHOP_TTL_DAYS = int(os.getenv("CUSTOMER_SHOP_TTL_DAYS", "0"))
+
+CUSTOMERS_TAB = os.getenv("CUSTOMERS_TAB", "customers")
 
 # ============================================================
 # GOOGLE CLIENTS
@@ -177,10 +178,10 @@ def parse_date(text: str) -> Optional[dt.date]:
 
     if "oggi" in t:
         return today
-    if "domani" in t:
-        return today + dt.timedelta(days=1)
-    if "dopodomani" in t:
-        return today + dt.timedelta(days=2)
+    reminder = {"domani": 1, "dopodomani": 2}
+    for k, v in reminder.items():
+        if k in t:
+            return today + dt.timedelta(days=v)
 
     m = re.search(r"\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b", t)
     if m:
@@ -284,12 +285,12 @@ def load_shop_auto(display_phone_number: str, phone_number_id: str) -> Optional[
 
 
 # ============================================================
-# customers tab: mapping persistente cliente -> shop
+# customers tab: cliente -> shop + stats
 # ============================================================
 def _get_customers_values() -> List[List[str]]:
     res = sheets().spreadsheets().values().get(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range="customers!A:Z"
+        range=f"{CUSTOMERS_TAB}!A:Z"
     ).execute()
     return res.get("values", []) or []
 
@@ -306,11 +307,22 @@ def _update_customers_range(a1: str, values: List[List[str]]):
 def _append_customers_row(values: List[str]):
     sheets().spreadsheets().values().append(
         spreadsheetId=GOOGLE_SHEET_ID,
-        range="customers!A:Z",
+        range=f"{CUSTOMERS_TAB}!A:Z",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": [values]},
     ).execute()
+
+
+def _ensure_customers_columns(header: List[str], needed: List[str]) -> Tuple[List[str], Dict[str, int], bool]:
+    col = {h: i for i, h in enumerate(header)}
+    changed = False
+    for n in needed:
+        if n not in col:
+            header.append(n)
+            changed = True
+            col[n] = len(header) - 1
+    return header, col, changed
 
 
 def get_customer_shop_id(customer_phone: str) -> Optional[str]:
@@ -318,7 +330,7 @@ def get_customer_shop_id(customer_phone: str) -> Optional[str]:
     if not phone:
         return None
 
-    rows = load_tab("customers")
+    rows = load_tab(CUSTOMERS_TAB)
     for r in rows:
         if norm_phone(r.get("phone")) != phone:
             continue
@@ -327,6 +339,7 @@ def get_customer_shop_id(customer_phone: str) -> Optional[str]:
         if not sid:
             return None
 
+        # TTL solo se c'è updated_at
         if CUSTOMER_SHOP_TTL_DAYS > 0:
             ts = parse_iso_dt(r.get("updated_at") or "")
             if ts:
@@ -339,7 +352,11 @@ def get_customer_shop_id(customer_phone: str) -> Optional[str]:
     return None
 
 
-def upsert_customer_shop(customer_phone: str, shop_id: str):
+def upsert_customer_shop(customer_phone: str, shop_id: str, touch_updated_at: bool = True):
+    """
+    Aggancia il cliente allo shop in tab customers.
+    Non rompe la tua struttura: aggiunge solo colonne mancanti.
+    """
     phone = norm_phone(customer_phone)
     sid = norm_text(shop_id)
     if not phone or not sid:
@@ -347,30 +364,27 @@ def upsert_customer_shop(customer_phone: str, shop_id: str):
 
     values = _get_customers_values()
 
-    # se tab vuoto, crea header
+    # se tab vuota, crea header "sensato" per il tuo caso
     if not values:
-        _update_customers_range("customers!A1:C1", [["phone", "shop_id", "updated_at"]])
+        header = ["shop_id", "phone", "last_service", "total_visits", "last_visit", "updated_at"]
+        _update_customers_range(f"{CUSTOMERS_TAB}!A1:Z1", [header])
+        values = _get_customers_values()
+
+    header = values[0]
+    header, col, changed = _ensure_customers_columns(
+        header,
+        needed=["shop_id", "phone", "updated_at", "last_service", "total_visits", "last_visit"]
+    )
+    if changed:
+        _update_customers_range(f"{CUSTOMERS_TAB}!A1:Z1", [header])
         values = _get_customers_values()
 
     header = values[0]
     col = {h: i for i, h in enumerate(header)}
 
-    # assicura colonne minime
-    needed = ["phone", "shop_id", "updated_at"]
-    changed = False
-    for n in needed:
-        if n not in col:
-            header.append(n)
-            changed = True
-    if changed:
-        _update_customers_range("customers!A1:Z1", [header])
-        values = _get_customers_values()
-        header = values[0]
-        col = {h: i for i, h in enumerate(header)}
-
     updated_at = utc_now_iso()
 
-    # cerca riga cliente
+    # cerca riga cliente (unica per phone)
     target_row = None  # 1-based
     for i in range(1, len(values)):
         row = values[i]
@@ -384,14 +398,97 @@ def upsert_customer_shop(customer_phone: str, shop_id: str):
         row = row + [""] * (len(header) - len(row))
         row[col["phone"]] = phone
         row[col["shop_id"]] = sid
-        row[col["updated_at"]] = updated_at
-        _update_customers_range(f"customers!A{target_row}:Z{target_row}", [row])
+        if touch_updated_at:
+            row[col["updated_at"]] = updated_at
+        _update_customers_range(f"{CUSTOMERS_TAB}!A{target_row}:Z{target_row}", [row])
     else:
         new_row = [""] * len(header)
         new_row[col["phone"]] = phone
         new_row[col["shop_id"]] = sid
-        new_row[col["updated_at"]] = updated_at
+        if touch_updated_at:
+            new_row[col["updated_at"]] = updated_at
+        # inizializza stats “base” se presenti
+        if "total_visits" in col:
+            new_row[col["total_visits"]] = "0"
         _append_customers_row(new_row)
+
+
+def update_customer_stats_after_booking(customer_phone: str, shop_id: str, service_name: str, start_dt: dt.datetime):
+    """
+    Dopo conferma appuntamento:
+    - assicura mapping phone->shop_id
+    - last_service = service_name
+    - total_visits += 1
+    - last_visit = ISO datetime (con tz dello start_dt)
+    - updated_at = UTC ISO
+    """
+    phone = norm_phone(customer_phone)
+    sid = norm_text(shop_id)
+    if not phone or not sid:
+        return
+
+    values = _get_customers_values()
+    if not values:
+        # crea header standard e poi rientra
+        upsert_customer_shop(phone, sid, touch_updated_at=True)
+        values = _get_customers_values()
+
+    header = values[0]
+    header, col, changed = _ensure_customers_columns(
+        header,
+        needed=["shop_id", "phone", "updated_at", "last_service", "total_visits", "last_visit"]
+    )
+    if changed:
+        _update_customers_range(f"{CUSTOMERS_TAB}!A1:Z1", [header])
+        values = _get_customers_values()
+
+    header = values[0]
+    col = {h: i for i, h in enumerate(header)}
+
+    target_row = None
+    for i in range(1, len(values)):
+        row = values[i]
+        p = row[col["phone"]] if col["phone"] < len(row) else ""
+        if norm_phone(p) == phone:
+            target_row = i + 1
+            break
+
+    updated_at = utc_now_iso()
+    last_visit = start_dt.replace(microsecond=0).isoformat()
+
+    if not target_row:
+        # crea cliente
+        new_row = [""] * len(header)
+        new_row[col["phone"]] = phone
+        new_row[col["shop_id"]] = sid
+        new_row[col["updated_at"]] = updated_at
+        new_row[col["last_service"]] = service_name
+        new_row[col["total_visits"]] = "1"
+        new_row[col["last_visit"]] = last_visit
+        _append_customers_row(new_row)
+        return
+
+    row = values[target_row - 1]
+    row = row + [""] * (len(header) - len(row))
+
+    # mapping shop
+    row[col["shop_id"]] = sid
+    row[col["phone"]] = phone
+
+    # stats
+    row[col["last_service"]] = service_name
+    row[col["last_visit"]] = last_visit
+    row[col["updated_at"]] = updated_at
+
+    # total_visits increment
+    cur_tv = row[col["total_visits"]] if col["total_visits"] < len(row) else "0"
+    try:
+        tv = int(str(cur_tv).strip() or "0")
+    except Exception:
+        tv = 0
+    row[col["total_visits"]] = str(tv + 1)
+
+    _update_customers_range(f"{CUSTOMERS_TAB}!A{target_row}:Z{target_row}", [row])
 
 
 # ============================================================
@@ -709,10 +806,9 @@ def find_best_slots(
 
 
 # ============================================================
-# CORE BOT LOGIC (IL TUO, INVARIATO)
+# CORE BOT LOGIC (quasi invariato: aggiungo update stats dopo booking)
 # ============================================================
 def handle(shop: Dict, customer_phone: str, text: str, customer_name: Optional[str] = None) -> str:
-    # --- INCOLLO IL TUO HANDLE ESATTAMENTE COME ORA ---
     shop_id = shop["shop_id"]
     key = f"{shop_id}:{norm_phone(customer_phone)}"
     sess = get_session(key)
@@ -778,6 +874,17 @@ def handle(shop: Dict, customer_phone: str, text: str, customer_name: Optional[s
                 booking_key=booking_key,
                 notes=sess.get("notes", "")
             )
+
+            # ✅ QUI: aggiorna customers (mapping + stats)
+            try:
+                update_customer_stats_after_booking(
+                    customer_phone=customer_phone,
+                    shop_id=shop_id,
+                    service_name=service["name"],
+                    start_dt=start
+                )
+            except Exception as e:
+                _log(f"[CUSTOMERS] update stats failed: {e}")
 
             clear_session(key)
             return (
@@ -1017,7 +1124,11 @@ def webhook():
                     if hint:
                         hinted_shop = get_shop_by_id(hint)
                         if hinted_shop:
-                            upsert_customer_shop(from_phone, hint)
+                            try:
+                                upsert_customer_shop(from_phone, hint, touch_updated_at=True)
+                            except Exception as e:
+                                _log(f"[CUSTOMERS] upsert from hint failed: {e}")
+
                             text_clean = strip_shop_hint(text)
                             if not text_clean:
                                 wa_send_text(
@@ -1028,13 +1139,22 @@ def webhook():
                                 continue
                             text = text_clean
 
-                    # 1) Prova a recuperare shop dal mapping cliente->shop (numero condiviso)
+                    # 1) Prova a recuperare shop dal mapping cliente->shop (customers)
                     saved_shop_id = get_customer_shop_id(from_phone)
                     shop = get_shop_by_id(saved_shop_id) if saved_shop_id else None
 
                     # 2) Se non c'è mapping, prova auto-detect (numero dedicato)
+                    auto_shop = None
                     if not shop:
-                        shop = load_shop_auto(display_phone_number, phone_number_id)
+                        auto_shop = load_shop_auto(display_phone_number, phone_number_id)
+                        shop = auto_shop
+
+                    # 2b) ✅ Se auto-detect ha trovato shop, salva subito mapping (così “si ricorda” il cliente)
+                    if auto_shop and auto_shop.get("shop_id"):
+                        try:
+                            upsert_customer_shop(from_phone, auto_shop["shop_id"], touch_updated_at=True)
+                        except Exception as e:
+                            _log(f"[CUSTOMERS] upsert from auto-detect failed: {e}")
 
                     # 3) Se ancora niente, chiedi QR/link
                     if not shop:
