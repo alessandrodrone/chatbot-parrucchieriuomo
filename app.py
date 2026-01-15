@@ -27,11 +27,12 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 
 # ============================================================
-# ENV - META WHATSAPP CLOUD (compatibilità nomi)
+# ENV - META WHATSAPP CLOUD
 # ============================================================
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN") or os.getenv("VERIFY_TOKEN", "")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN", "")
 
+# fallback (di solito NON viene usato, perché rispondiamo con il phone_number_id che arriva nel webhook)
 META_PHONE_NUMBER_ID = (
     os.getenv("META_PHONE_NUMBER_ID")
     or os.getenv("PHONE_NUMBER_ID")
@@ -48,6 +49,10 @@ SESSION_TTL_MINUTES = int(os.getenv("SESSION_TTL_MINUTES", "30"))
 MAX_LOOKAHEAD_DAYS = int(os.getenv("MAX_LOOKAHEAD_DAYS", "14"))
 DEFAULT_SLOT_MINUTES = int(os.getenv("DEFAULT_SLOT_MINUTES", "30"))
 BLOCK_KEYWORDS = {"chiuso", "ferie", "malattia", "off", "closed", "vacation", "sick"}
+
+# Quanto dura l'associazione cliente->shop nel tab customers
+# 0 = non scade mai
+CUSTOMER_SHOP_TTL_DAYS = int(os.getenv("CUSTOMER_SHOP_TTL_DAYS", "0"))
 
 # ============================================================
 # GOOGLE CLIENTS
@@ -131,9 +136,6 @@ def _is_second_choice(t: str) -> bool:
 
 
 def shop_tz(shop: Dict) -> dt.tzinfo:
-    """
-    Usa il timezone dello shop se presente (es. Europe/Rome), altrimenti UTC.
-    """
     tz_name = norm_text(shop.get("timezone")) or "UTC"
     if ZoneInfo:
         try:
@@ -143,8 +145,31 @@ def shop_tz(shop: Dict) -> dt.tzinfo:
     return dt.timezone.utc
 
 
+def utc_now_iso() -> str:
+    return now().replace(microsecond=0).isoformat()
+
+
+def parse_iso_dt(s: str) -> Optional[dt.datetime]:
+    try:
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
 # ============================================================
-# DATE / TIME PARSING (semplice)
+# C2: SHOP=... nel primo messaggio (QR/link)
+# ============================================================
+def extract_shop_hint(text: str) -> Optional[str]:
+    m = re.search(r"\bSHOP\s*=\s*([A-Za-z0-9_\-]+)\b", text or "", flags=re.I)
+    return m.group(1) if m else None
+
+
+def strip_shop_hint(text: str) -> str:
+    return re.sub(r"\bSHOP\s*=\s*[A-Za-z0-9_\-]+\b", "", text or "", flags=re.I).strip()
+
+
+# ============================================================
+# DATE / TIME PARSING
 # ============================================================
 def parse_date(text: str) -> Optional[dt.date]:
     t = safe_lower(text)
@@ -225,30 +250,153 @@ def load_tab(tab: str) -> List[Dict]:
     return out
 
 
-def load_shop(display_phone_number: str, phone_number_id: str) -> Optional[Dict]:
+def get_shop_by_id(shop_id: str) -> Optional[Dict]:
+    sid = norm_text(shop_id)
+    if not sid:
+        return None
+    for s in load_tab("shops"):
+        if norm_text(s.get("shop_id")) == sid:
+            return s
+    return None
+
+
+def load_shop_auto(display_phone_number: str, phone_number_id: str) -> Optional[Dict]:
     """
-    Risolvi lo shop in modo robusto:
-    - prima prova per phone_number_id se nel foglio shops esiste colonna "phone_number_id"
-    - poi per display_phone_number contro "whatsapp_number"
+    - Se phone_number_id identifica UNO shop (numero dedicato) -> ok
+    - Altrimenti (numero condiviso) non scegliere qui: useremo customers / SHOP=
     """
     pnid = norm_text(phone_number_id)
     disp = norm_phone(display_phone_number)
-
     shops = load_tab("shops")
 
     if pnid:
-        for s in shops:
-            if norm_text(s.get("phone_number_id")) == pnid:
-                return s
+        matches = [s for s in shops if norm_text(s.get("phone_number_id")) == pnid]
+        if len(matches) == 1:
+            return matches[0]
 
+    # fallback (utile se hai 1 solo shop su quel display number)
     if disp:
-        for s in shops:
-            if norm_phone(s.get("whatsapp_number")) == disp:
-                return s
+        matches = [s for s in shops if norm_phone(s.get("whatsapp_number")) == disp]
+        if len(matches) == 1:
+            return matches[0]
 
     return None
 
 
+# ============================================================
+# customers tab: mapping persistente cliente -> shop
+# ============================================================
+def _get_customers_values() -> List[List[str]]:
+    res = sheets().spreadsheets().values().get(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range="customers!A:Z"
+    ).execute()
+    return res.get("values", []) or []
+
+
+def _update_customers_range(a1: str, values: List[List[str]]):
+    sheets().spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=a1,
+        valueInputOption="RAW",
+        body={"values": values},
+    ).execute()
+
+
+def _append_customers_row(values: List[str]):
+    sheets().spreadsheets().values().append(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range="customers!A:Z",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [values]},
+    ).execute()
+
+
+def get_customer_shop_id(customer_phone: str) -> Optional[str]:
+    phone = norm_phone(customer_phone)
+    if not phone:
+        return None
+
+    rows = load_tab("customers")
+    for r in rows:
+        if norm_phone(r.get("phone")) != phone:
+            continue
+
+        sid = norm_text(r.get("shop_id"))
+        if not sid:
+            return None
+
+        if CUSTOMER_SHOP_TTL_DAYS > 0:
+            ts = parse_iso_dt(r.get("updated_at") or "")
+            if ts:
+                age_days = (now() - ts).total_seconds() / 86400.0
+                if age_days > CUSTOMER_SHOP_TTL_DAYS:
+                    return None
+
+        return sid
+
+    return None
+
+
+def upsert_customer_shop(customer_phone: str, shop_id: str):
+    phone = norm_phone(customer_phone)
+    sid = norm_text(shop_id)
+    if not phone or not sid:
+        return
+
+    values = _get_customers_values()
+
+    # se tab vuoto, crea header
+    if not values:
+        _update_customers_range("customers!A1:C1", [["phone", "shop_id", "updated_at"]])
+        values = _get_customers_values()
+
+    header = values[0]
+    col = {h: i for i, h in enumerate(header)}
+
+    # assicura colonne minime
+    needed = ["phone", "shop_id", "updated_at"]
+    changed = False
+    for n in needed:
+        if n not in col:
+            header.append(n)
+            changed = True
+    if changed:
+        _update_customers_range("customers!A1:Z1", [header])
+        values = _get_customers_values()
+        header = values[0]
+        col = {h: i for i, h in enumerate(header)}
+
+    updated_at = utc_now_iso()
+
+    # cerca riga cliente
+    target_row = None  # 1-based
+    for i in range(1, len(values)):
+        row = values[i]
+        p = row[col["phone"]] if col["phone"] < len(row) else ""
+        if norm_phone(p) == phone:
+            target_row = i + 1
+            break
+
+    if target_row:
+        row = values[target_row - 1]
+        row = row + [""] * (len(header) - len(row))
+        row[col["phone"]] = phone
+        row[col["shop_id"]] = sid
+        row[col["updated_at"]] = updated_at
+        _update_customers_range(f"customers!A{target_row}:Z{target_row}", [row])
+    else:
+        new_row = [""] * len(header)
+        new_row[col["phone"]] = phone
+        new_row[col["shop_id"]] = sid
+        new_row[col["updated_at"]] = updated_at
+        _append_customers_row(new_row)
+
+
+# ============================================================
+# LOAD SHOP DATA
+# ============================================================
 def load_services(shop_id: str) -> List[Dict]:
     return [
         {
@@ -267,9 +415,7 @@ def load_hours(shop_id: str) -> Dict[int, List[Tuple[dt.time, dt.time]]]:
         if r.get("shop_id") == shop_id:
             try:
                 wd = int(r["weekday"])
-                out[wd].append(
-                    (dt.time.fromisoformat(r["start"]), dt.time.fromisoformat(r["end"]))
-                )
+                out[wd].append((dt.time.fromisoformat(r["start"]), dt.time.fromisoformat(r["end"])))
             except Exception:
                 pass
     return out
@@ -380,7 +526,7 @@ def parse_operator_prefs(text: str, operators: List[Dict]) -> Tuple[Optional[str
 
 
 # ============================================================
-# CALENDAR HELPERS
+# CALENDAR HELPERS (UGUALI)
 # ============================================================
 def _has_block_keyword(summary: str) -> bool:
     s = safe_lower(summary)
@@ -481,7 +627,7 @@ def create_booking_event(
 
 
 # ============================================================
-# SEARCH (ritorna fino a N opzioni)
+# SEARCH (UGUALE)
 # ============================================================
 def find_best_slots(
     hours: Dict[int, List[Tuple[dt.time, dt.time]]],
@@ -563,9 +709,10 @@ def find_best_slots(
 
 
 # ============================================================
-# CORE BOT LOGIC
+# CORE BOT LOGIC (IL TUO, INVARIATO)
 # ============================================================
 def handle(shop: Dict, customer_phone: str, text: str, customer_name: Optional[str] = None) -> str:
+    # --- INCOLLO IL TUO HANDLE ESATTAMENTE COME ORA ---
     shop_id = shop["shop_id"]
     key = f"{shop_id}:{norm_phone(customer_phone)}"
     sess = get_session(key)
@@ -745,7 +892,7 @@ def handle(shop: Dict, customer_phone: str, text: str, customer_name: Optional[s
 
 
 # ============================================================
-# META SIGNATURE VERIFY (opzionale ma consigliata)
+# META SIGNATURE VERIFY
 # ============================================================
 def verify_meta_signature(req) -> bool:
     if not META_APP_SECRET:
@@ -791,11 +938,6 @@ def wa_send_text(to_phone: str, text: str, phone_number_id: Optional[str] = None
 
 
 def _is_meta_sample_payload(display_phone: str, phone_number_id: str) -> bool:
-    """
-    Meta "Send to server" spesso manda:
-    display_phone_number=16505551111 e phone_number_id=123456123 (finto).
-    In quel caso NON dobbiamo rispondere.
-    """
     return norm_phone(display_phone) == "16505551111" or norm_text(phone_number_id) == "123456123"
 
 
@@ -857,9 +999,8 @@ def webhook():
 
                     _log(f"[WEBHOOK] msg_id={msg_id} from={from_phone} type={mtype} display_phone={display_phone_number} phone_number_id={phone_number_id}")
 
-                    # Non rispondere ai payload di esempio (Meta "Send to server")
                     if _is_meta_sample_payload(display_phone_number, phone_number_id):
-                        _log("[WEBHOOK] Meta sample payload detected -> skip reply (this is expected).")
+                        _log("[WEBHOOK] Meta sample payload detected -> skip reply.")
                         continue
 
                     if mtype != "text":
@@ -871,10 +1012,38 @@ def webhook():
 
                     text = ((m.get("text") or {}).get("body")) or ""
 
-                    shop = load_shop(display_phone_number, phone_number_id)
+                    # 0) Se arriva SHOP=..., salva mapping persistente
+                    hint = extract_shop_hint(text)
+                    if hint:
+                        hinted_shop = get_shop_by_id(hint)
+                        if hinted_shop:
+                            upsert_customer_shop(from_phone, hint)
+                            text_clean = strip_shop_hint(text)
+                            if not text_clean:
+                                wa_send_text(
+                                    from_phone,
+                                    f"Perfetto ✅ Sei connesso a *{hinted_shop.get('name','questa sede')}*.\nDimmi che servizio ti serve 😊",
+                                    phone_number_id=phone_number_id
+                                )
+                                continue
+                            text = text_clean
+
+                    # 1) Prova a recuperare shop dal mapping cliente->shop (numero condiviso)
+                    saved_shop_id = get_customer_shop_id(from_phone)
+                    shop = get_shop_by_id(saved_shop_id) if saved_shop_id else None
+
+                    # 2) Se non c'è mapping, prova auto-detect (numero dedicato)
                     if not shop:
-                        _log(f"[WEBHOOK] shop NOT found for display_phone={display_phone_number} phone_number_id={phone_number_id}")
-                        # Nota: non rispondo se non trovo lo shop, per evitare errori su numeri test/finti
+                        shop = load_shop_auto(display_phone_number, phone_number_id)
+
+                    # 3) Se ancora niente, chiedi QR/link
+                    if not shop:
+                        wa_send_text(
+                            from_phone,
+                            "Per iniziare, usa il QR/link del negozio (contiene `SHOP=...`).\n"
+                            "Esempio: `SHOP=barber_test_3 taglio domani`",
+                            phone_number_id=phone_number_id
+                        )
                         continue
 
                     reply = handle(shop, from_phone, text, customer_name=contact_name)
@@ -899,8 +1068,7 @@ def test():
     if not phone or not customer:
         return jsonify({"error": "missing phone or customer"}), 400
 
-    # qui non abbiamo phone_number_id, quindi passiamo stringa vuota
-    shop = load_shop(phone, "")
+    shop = load_shop_auto(phone, "")
     if not shop:
         return jsonify({"error": "shop not found"}), 404
 
